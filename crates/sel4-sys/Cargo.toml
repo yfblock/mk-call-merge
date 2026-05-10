@@ -1,0 +1,7 @@
+[package]
+name = "sel4-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal seL4 system interface for x86_64, providing syscall wrappers, capability types, and kernel ABI types"
+
+[dependencies]

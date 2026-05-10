@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/sel4-sys",
+  "root-task",
+]
+
+[workspace.package]
+edition = "2024"

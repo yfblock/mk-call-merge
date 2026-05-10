@@ -1,0 +1,15 @@
+# Build artifacts
+target/
+*.elf
+*.bz
+
+# seL4 environment/install
+.env/
+
+# Generated images
+*.img
+seL4
+
+# OS
+.DS_Store
+Thumbs.db

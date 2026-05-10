@@ -1,0 +1,8 @@
+[package]
+name = "root-task"
+version = "0.1.0"
+edition = "2024"
+description = "seL4 root task — initializes the system and runs built-in tests"
+
+[dependencies]
+sel4-sys = { path = "../crates/sel4-sys" }
