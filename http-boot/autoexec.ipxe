@@ -1,0 +1,12 @@
+#!ipxe
+# 静态 IP 配置（跳过 DHCP，启动更快）
+# 请根据你的网络环境修改以下地址
+set net0/ip 192.168.1.248
+set net0/netmask 255.255.255.0
+set net0/gateway 192.168.1.1
+ifopen net0
+
+echo ====================================================
+echo   iPXE HTTP Boot: Loading seL4 ISO via sanboot...
+echo ====================================================
+sanboot http://192.168.1.140:8000/sel4.iso || shell

@@ -13,3 +13,10 @@ seL4
 # OS
 .DS_Store
 Thumbs.db
+
+# http-boot ipxe
+http-boot/grubx64.efi
+http-boot/ipxe.efi
+http-boot/snponly.efi
+http-boot/vmlinuz
+http-boot/sel4.iso

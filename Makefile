@@ -16,12 +16,15 @@ SEL4_REPO  := https://github.com/seL4/seL4.git
 SEL4_PREFIX := $(abspath seL4)
 KERNEL_ELF := $(SEL4_PREFIX)/build/kernel.elf
 
+# LAPIC mode: XAPIC (default, works everywhere) or X2APIC (real hardware with many CPUs)
+LAPIC_MODE ?= XAPIC
+
 CARGO_FLAGS := --target $(TARGET) --release \
 	-Z build-std=core,alloc,compiler_builtins \
 	-Z build-std-features=compiler-builtins-mem
 
 .DEFAULT_GOAL := help
-.PHONY: build image run run-kvm iso iso-run iso-run-kvm uefi uefi-run uefi-run-kvm clean help kernel all
+.PHONY: build image run run-kvm iso iso-run iso-run-kvm uefi uefi-run uefi-run-kvm clean help kernel patch http-boot http-boot-all http-boot-iso http-boot-grub http-boot-ipxe all
 
 ## Build everything (kernel + root-task + image) in one command
 all: kernel build image
@@ -31,15 +34,27 @@ all: kernel build image
 build:
 	cargo build $(CARGO_FLAGS) -p root-task
 
-## Build seL4 kernel (clones repo if needed, requires cmake + gcc)
-kernel:
-	@which cmake >/dev/null 2>&1 || { echo "cmake required. Install: apt-get install cmake"; exit 1; }
+## Apply seL4 UEFI boot patches
+patch:
 	@test -d $(SEL4_PREFIX)/.git || { echo "==> Cloning seL4..."; git clone $(SEL4_REPO) $(SEL4_PREFIX); }
+	@echo "==> Applying seL4 UEFI boot patches..."
+	cd $(SEL4_PREFIX) && git apply --check ../support/sel4-uefi-boot.patch 2>/dev/null && \
+		git apply ../support/sel4-uefi-boot.patch && echo "  Patch applied." || echo "  Patch already applied or not applicable."
+
+## Build seL4 kernel (clones repo if needed, requires cmake + gcc + ninja)
+## Usage: make kernel                     (default XAPIC)
+##        make kernel LAPIC_MODE=X2APIC   (for real hardware with x2APIC)
+kernel: patch
+	@which cmake >/dev/null 2>&1 || { echo "cmake required. Install: apt-get install cmake"; exit 1; }
+	@which ninja >/dev/null 2>&1 || { echo "ninja required. Install: apt-get install ninja-build"; exit 1; }
 	@mkdir -p $(SEL4_PREFIX)/build
-	cd $(SEL4_PREFIX)/build && cmake -DCROSS_COMPILER_PREFIX="" \
-		-DKernelPlatform=pc99 -DKernelSel4Arch=x86_64 .. && \
-		make kernel.elf
-	@echo "==> Kernel built: $(KERNEL_ELF)"
+	cd $(SEL4_PREFIX)/build && cmake -G Ninja -DCROSS_COMPILER_PREFIX="" \
+		-DKernelPlatform=pc99 -DKernelSel4Arch=x86_64 \
+		-DKernelLAPICMode=$(LAPIC_MODE) \
+		-DKernelVerificationBuild=OFF \
+		-DKernelPrinting=ON .. && \
+		ninja kernel.elf
+	@echo "==> Kernel built: $(KERNEL_ELF) (LAPIC=$(LAPIC_MODE))"
 
 ## Build bootable image (32-bit ELF kernel wrapper via objcopy)
 image: build
@@ -145,6 +160,7 @@ menuentry "seL4 (UEFI)" {\n\
 uefi-run: uefi
 	qemu-system-x86_64 -cpu max \
 		-m 512M -nographic -serial mon:stdio -no-reboot \
+		-vga std \
 		-bios /usr/share/ovmf/OVMF.fd \
 		-cdrom $(UEFI_ISO_FILE) || true
 
@@ -152,6 +168,7 @@ uefi-run: uefi
 uefi-run-kvm: uefi
 	qemu-system-x86_64 -cpu host -enable-kvm \
 		-m 512M -nographic -serial mon:stdio -no-reboot \
+		-vga std \
 		-bios /usr/share/ovmf/OVMF.fd \
 		-cdrom $(UEFI_ISO_FILE) || true
 
@@ -160,12 +177,64 @@ clean:
 	cargo clean
 	rm -f $(IMAGE_ELF)
 
+## Build everything for iPXE HTTP boot (kernel + root-task + UEFI ISO)
+## Requires: cmake, ninja, gcc, grub-mkrescue, python3 (for iPXE build)
+HTTP_BOOT_DIR := http-boot
+HTTP_BOOT_IPXE_REPO := https://github.com/ipxe/ipxe.git
+HTTP_BOOT_IPXE_PREFIX := $(abspath ipxe)
+
+http-boot-iso: kernel build
+	@mkdir -p $(UEFI_ISO_DIR)/boot/grub
+	@cp $(KERNEL_ELF) $(UEFI_ISO_DIR)/boot/kernel.elf
+	@cp $(APP_ELF) $(UEFI_ISO_DIR)/boot/root-task
+	@printf 'insmod acpi\nserial --unit=0 --speed=115200\nterminal_input serial\nterminal_output serial\nset timeout=0\n\n\
+multiboot2 /boot/kernel.elf\nmodule2 /boot/root-task\nboot\n' > $(UEFI_ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $(HTTP_BOOT_DIR)/sel4.iso $(UEFI_ISO_DIR)
+	@echo "==> HTTP boot ISO ready: $(HTTP_BOOT_DIR)/sel4.iso"
+
+http-boot-ipxe:
+	@test -f $(HTTP_BOOT_DIR)/autoexec.ipxe || { echo "==> $(HTTP_BOOT_DIR)/autoexec.ipxe not found. Create it first."; exit 1; }
+	@test -d $(HTTP_BOOT_IPXE_PREFIX)/.git || { echo "==> Cloning iPXE..."; git clone --depth 1 $(HTTP_BOOT_IPXE_REPO) $(HTTP_BOOT_IPXE_PREFIX); }
+	cd $(HTTP_BOOT_IPXE_PREFIX)/src && $(MAKE) -j$$(nproc) bin-x86_64-efi/ipxe.efi \
+		EMBED=../../$(HTTP_BOOT_DIR)/autoexec.ipxe
+	cp $(HTTP_BOOT_IPXE_PREFIX)/src/bin-x86_64-efi/ipxe.efi $(HTTP_BOOT_DIR)/ipxe.efi
+	@echo "==> iPXE ready: $(HTTP_BOOT_DIR)/ipxe.efi"
+
+http-boot-grub: http-boot-iso
+	@which grub-mkstandalone >/dev/null 2>&1 || { echo "grub-mkstandalone required."; exit 1; }
+	grub-mkstandalone \
+		--format=x86_64-efi \
+		--output=$(HTTP_BOOT_DIR)/grubx64.efi \
+		--modules="multiboot multiboot2 serial acpi" \
+		--install-modules="multiboot multiboot2 serial acpi" \
+		--locales="" --fonts="" \
+		"boot/grub/grub.cfg=$(UEFI_ISO_DIR)/boot/grub/grub.cfg" \
+		"boot/kernel.elf=$(KERNEL_ELF)" \
+		"boot/root-task=$(APP_ELF)"
+	@echo "==> GRUB EFI ready: $(HTTP_BOOT_DIR)/grubx64.efi"
+
+## Build all HTTP boot components (iPXE + GRUB + ISO)
+http-boot-all: http-boot-iso http-boot-grub http-boot-ipxe
+	@echo ""
+	@echo "==> HTTP boot files ready in $(HTTP_BOOT_DIR)/"
+	@ls -lh $(HTTP_BOOT_DIR)/ipxe.efi $(HTTP_BOOT_DIR)/grubx64.efi $(HTTP_BOOT_DIR)/sel4.iso
+	@echo ""
+	@echo "  Start HTTP server:  cd $(HTTP_BOOT_DIR) && python3 -m http.server 8000"
+	@echo "  Boot via iPXE:      chain http://<server>:8000/grubx64.efi"
+	@echo "  Boot via sanboot:   sanboot http://<server>:8000/sel4.iso"
+
+## Start HTTP boot server (default port 8000)
+http-boot:
+	cd $(HTTP_BOOT_DIR) && python3 -m http.server 8000
+
 ## Help
 help:
 	@echo "rel4-linux-kit — seL4 x86_64 Root Task"
 	@echo ""
 	@echo "  make all        Full build: clone seL4 + build kernel + root-task + image"
-	@echo "  make kernel     Build seL4 kernel (clones repo if needed)"
+	@echo "  make kernel     Build seL4 kernel (applies patches + clones repo if needed)"
+	@echo "                  LAPIC_MODE=XAPIC (default) or LAPIC_MODE=X2APIC"
+	@echo "  make patch      Apply seL4 UEFI boot patches"
 	@echo "  make build      Build root task"
 	@echo "  make run        Build image + boot in QEMU"
 	@echo "  make run-kvm    Build image + boot in QEMU with KVM acceleration"
@@ -175,5 +244,11 @@ help:
 	@echo "  make uefi       Build UEFI-bootable ISO (OVMF)"
 	@echo "  make uefi-run   Boot UEFI ISO in QEMU with OVMF"
 	@echo "  make uefi-run-kvm  Boot UEFI ISO in QEMU with OVMF + KVM"
+	@echo "  make http-boot-all   Build all HTTP boot components (iPXE + GRUB + ISO)"
+	@echo "  make http-boot       Start HTTP boot server (port 8000)"
+	@echo "  make http-boot-iso   Build UEFI ISO for HTTP boot"
+	@echo "  make http-boot-grub  Build GRUB EFI for HTTP boot"
+	@echo "  make http-boot-ipxe  Build iPXE EFI for HTTP boot"
 	@echo ""
 	@sed -n 's/^## //p' Makefile
+

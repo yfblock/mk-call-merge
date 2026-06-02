@@ -1,0 +1,56 @@
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index 55b7066fb..7c0ca97be 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -340,6 +340,18 @@ static BOOT_CODE bool_t try_boot_sys(void)
+     p_region_t ui_p_regs;
+     paddr_t load_paddr;
+ 
++#if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
++    /* Initialize serial port for printf output. In multiboot2 path with ACPI
++     * tags, acpi_init() (which calls serial_init) may be skipped. */
++    x86KSdebugPort = 0x3f8;
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x00), "Nd"((uint16_t)0x3f9)); /* disable interrupts */
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x80), "Nd"((uint16_t)0x3fb)); /* enable DLAB */
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x01), "Nd"((uint16_t)0x3f8)); /* divisor lo */
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x00), "Nd"((uint16_t)0x3f9)); /* divisor hi */
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x03), "Nd"((uint16_t)0x3fb)); /* 8N1 */
++    asm volatile("outb %0, %1" : : "a"((uint8_t)0x0b), "Nd"((uint16_t)0x3fc)); /* DTR/RTS/OUT2 */
++#endif
++
+     boot_state.ki_p_reg = get_p_reg_kernel_img();
+ 
+     if (!x86_cpuid_initialize()) {
+@@ -449,7 +461,14 @@ static BOOT_CODE bool_t try_boot_sys(void)
+     }
+ 
+     mods_end_paddr = ROUND_UP(mods_end_paddr, PAGE_BITS);
+-    assert(mods_end_paddr > boot_state.ki_p_reg.end);
++
++    /* If boot module is before the kernel (can happen in UEFI mode where GRUB
++     * places modules at a lower address), skip past the kernel to avoid overlap. */
++    if (mods_end_paddr <= boot_state.ki_p_reg.end) {
++        printf("Boot module at 0x%lx is before kernel end 0x%lx, relocating load address\n",
++               mods_end_paddr, boot_state.ki_p_reg.end);
++        mods_end_paddr = boot_state.ki_p_reg.end;
++    }
+ 
+     printf("ELF-loading userland images from boot modules:\n");
+     load_paddr = mods_end_paddr;
+@@ -698,6 +717,16 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+         return false;
+     }
+ 
++    /* If no ACPI RSDP was provided via multiboot2 tags, fall back to scanning
++     * BIOS memory area. This is needed when booting via GRUB EFI (e.g. iPXE
++     * chainload) where GRUB may not pass ACPI tags. */
++    if (boot_state.acpi_rsdp.rsdt_address == 0) {
++        printf("No ACPI info in multiboot2 tags, scanning BIOS memory...\n");
++        if (!acpi_init(&boot_state.acpi_rsdp)) {
++            return false;
++        }
++    }
++
+     return true;
+ }
+ 

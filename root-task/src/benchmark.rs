@@ -15,7 +15,7 @@ const IPC_BUF_VADDR: usize = 0x501000;
 
 /// Read the x86_64 TSC (Time Stamp Counter).
 #[inline]
-fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     unsafe {
         let lo: u32;
         let hi: u32;
