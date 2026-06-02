@@ -30,8 +30,10 @@ CARGO_FLAGS := --target $(TARGET) --release \
 all: kernel build image
 	@echo "==> All done. Run 'make run' to boot in QEMU."
 
-## Build root-task
+## Build root-task, blk-task, and lwext4-task
 build:
+	PATH=/tmp/x86_64-linux-musl-cross/bin:$$PATH cargo build $(CARGO_FLAGS) -p blk-task
+	PATH=/tmp/x86_64-linux-musl-cross/bin:$$PATH cargo build $(CARGO_FLAGS) -p lwext4-task
 	cargo build $(CARGO_FLAGS) -p root-task
 
 ## Apply seL4 UEFI boot patches
@@ -52,7 +54,8 @@ kernel: patch
 		-DKernelPlatform=pc99 -DKernelSel4Arch=x86_64 \
 		-DKernelLAPICMode=$(LAPIC_MODE) \
 		-DKernelVerificationBuild=OFF \
-		-DKernelPrinting=ON .. && \
+		-DKernelPrinting=ON \
+		-DKernelSupportPCID=OFF .. && \
 		ninja kernel.elf
 	@echo "==> Kernel built: $(KERNEL_ELF) (LAPIC=$(LAPIC_MODE))"
 

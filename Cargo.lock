@@ -3,12 +3,86 @@
 version = 4
 
 [[package]]
-name = "root-task"
+name = "bitmaps"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
+
+[[package]]
+name = "blk-task"
 version = "0.1.0"
 dependencies = [
  "sel4-sys",
 ]
 
 [[package]]
+name = "flatten_objects"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f7719d63de27ac93e7cd2c8e0c03083f8b0ff7f842fdb6280b8cdcac21b4baf"
+dependencies = [
+ "bitmaps",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "log"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
+
+[[package]]
+name = "lwext4-task"
+version = "0.1.0"
+dependencies = [
+ "blk-task",
+ "flatten_objects",
+ "log",
+ "lwext4_rust",
+ "sel4-sys",
+ "spin",
+]
+
+[[package]]
+name = "lwext4_rust"
+version = "0.2.0"
+source = "git+https://github.com/Azure-stars/lwext4_rust.git?rev=2e56b0a#2e56b0aa2680b210892a46375fefca2bdf6e2865"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "root-task"
+version = "0.1.0"
+dependencies = [
+ "blk-task",
+ "lwext4-task",
+ "sel4-sys",
+]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
 name = "sel4-sys"
 version = "0.1.0"
+
+[[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]

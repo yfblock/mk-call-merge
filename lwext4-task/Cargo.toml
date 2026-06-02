@@ -1,0 +1,12 @@
+[package]
+name = "lwext4-task"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sel4-sys = { path = "../crates/sel4-sys" }
+blk-task = { path = "../blk-task" }
+lwext4_rust = { git = "https://github.com/Azure-stars/lwext4_rust.git", default-features = false, rev = "2e56b0a" }
+flatten_objects = "0.2.3"
+spin = "0.9"
+log = "0.4"

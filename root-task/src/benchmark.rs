@@ -10,8 +10,10 @@ use crate::slot::SLOT_MANAGER;
 const PAGE_SIZE: usize = 4096;
 const ITERATIONS: u64 = 10000;
 const CNODE_DEPTH: usize = 64;
-const STACK_VADDR: usize = 0x500000;
-const IPC_BUF_VADDR: usize = 0x501000;
+// 虚拟地址必须在 root-task 地址空间之外（root-task .bss 含 4MB ramdisk，延伸到 ~0xB40000）
+// 并且在同一个 2MB 页目录项范围内（PageTable 映射在 0xF00000）
+const STACK_VADDR: usize = 0xF10000;
+const IPC_BUF_VADDR: usize = 0xF11000;
 
 /// Read the x86_64 TSC (Time Stamp Counter).
 #[inline]
@@ -67,13 +69,13 @@ pub fn run(bi: &BootInfo) {
     }
     seL4_DebugPutString("  kernel objects OK\n");
 
-    // --- Create and map a PageTable for vaddr 0x400000 ---
+    // --- Create and map a PageTable for vaddr 0xF00000 ---
     let pt_slot = { SLOT_MANAGER.lock().alloc().unwrap() };
     let err = seL4_Untyped_Retype(untyped_slot, ObjectType::PageTable as usize,
         ObjectType::PageTable.size_bits(), init_slots::CNODE, init_slots::CNODE,
         CNODE_DEPTH, pt_slot, 1);
     if err != 0 { seL4_DebugPutString("  FAILED creating PageTable\n"); return; }
-    let err = seL4_PageTable_Map(pt_slot, init_slots::VSPACE, 0x400000, 0);
+    let err = seL4_PageTable_Map(pt_slot, init_slots::VSPACE, 0xF00000, 0);
     if err != 0 { seL4_DebugPutString("  FAILED mapping PageTable\n"); return; }
 
     // --- Map frames into VSpace ---

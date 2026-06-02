@@ -6,3 +6,5 @@ description = "seL4 root task — initializes the system and runs built-in tests
 
 [dependencies]
 sel4-sys = { path = "../crates/sel4-sys" }
+blk-task = { path = "../blk-task" }
+lwext4-task = { path = "../lwext4-task" }

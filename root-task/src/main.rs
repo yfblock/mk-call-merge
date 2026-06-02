@@ -122,6 +122,21 @@ fn main(bi_frame_vptr: usize) {
 
     print_system_info(bi_frame_vptr);
 
+    // 初始化 ramdisk 为 ext4 文件系统镜像
+    let ext4_img = include_bytes!("../../blk-task/ext4.img");
+    blk_task::BLK.init_from_image(ext4_img);
+    seL4_DebugPutString("[blk-task] ramdisk initialized with ext4 image\n");
+
+    // Test blk-task ramdisk
+    test_blk_task();
+
+    // Test lwext4-task filesystem
+    test_lwext4_task();
+
+    // Benchmark
+    bench_blk_task();
+    bench_lwext4_task();
+
     // Run multi-threaded IPC performance benchmark.
     benchmark::run(&bi);
 
@@ -284,4 +299,191 @@ fn print_system_info(bi_frame_vptr: usize) {
     }
 
     seL4_DebugPutString("===========================\n");
+}
+
+fn test_blk_task() {
+    use blk_task::{BlockIface, RamdiskBlkImpl, BLOCK_SIZE};
+
+    seL4_DebugPutString("\n[blk-task] Testing ramdisk block device...\n");
+
+    let blk = RamdiskBlkImpl::new();
+
+    seL4_DebugPutString("  Capacity: ");
+    put_u64(blk.capacity());
+    seL4_DebugPutString(" bytes\n");
+
+    // 写入测试数据
+    let mut write_buf = [0u8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        write_buf[i] = (i & 0xff) as u8;
+    }
+    blk.write_block(0, &write_buf);
+    seL4_DebugPutString("  Write block 0: OK\n");
+
+    // 读回验证
+    let mut read_buf = [0u8; BLOCK_SIZE];
+    blk.read_block(0, &mut read_buf);
+    let ok = read_buf == write_buf;
+    seL4_DebugPutString("  Read block 0: ");
+    if ok {
+        seL4_DebugPutString("OK (data verified)\n");
+    } else {
+        seL4_DebugPutString("FAILED (data mismatch)\n");
+    }
+
+    seL4_DebugPutString("[blk-task] Test completed.\n");
+}
+
+fn test_lwext4_task() {
+    use lwext4_task::{EXT4FSImpl, FSIface};
+
+    seL4_DebugPutString("\n[lwext4-task] Testing ext4 filesystem...\n");
+
+    let mut fs = EXT4FSImpl::new();
+
+    // 创建目录
+    fs.mkdir("/test");
+    seL4_DebugPutString("  mkdir /test: OK\n");
+
+    // 创建并写入文件 (O_RDWR|O_CREAT|O_TRUNC = 0x242)
+    match fs.open("/test/hello.txt", 0x242) {
+        Ok((inode, _size)) => {
+            seL4_DebugPutString("  open /test/hello.txt: OK (inode=");
+            put_u64(inode as u64);
+            seL4_DebugPutString(")\n");
+
+            let data = b"Hello, seL4 ext4!";
+            fs.write_at(inode as u64, 0, data);
+            seL4_DebugPutString("  write: OK\n");
+
+            // 读回验证
+            let mut buf = [0u8; 64];
+            let n = fs.read_at(inode as u64, 0, &mut buf);
+            if &buf[..n] == data {
+                seL4_DebugPutString("  read: OK (data verified)\n");
+            } else {
+                seL4_DebugPutString("  read: FAILED (data mismatch)\n");
+            }
+
+            // stat
+            let st = fs.stat(inode);
+            seL4_DebugPutString("  stat size=");
+            put_u64(st.size);
+            seL4_DebugPutString("\n");
+
+            fs.close(inode);
+            seL4_DebugPutString("  close: OK\n");
+        }
+        Err(e) => {
+            seL4_DebugPutString("  open failed: err=");
+            put_u64(e as u64 as u64);
+            seL4_DebugPutString("\n");
+        }
+    }
+
+    seL4_DebugPutString("[lwext4-task] Test completed.\n");
+}
+
+fn bench_blk_task() {
+    use blk_task::{BlockIface, BLOCK_SIZE, BLK};
+
+    seL4_DebugPutString("\n[bench] Block device benchmark...\n");
+
+    let block_count = 64; // 测试 64 个块 = 32KB
+    let total_bytes = block_count * BLOCK_SIZE;
+    let mut buf = [0u8; BLOCK_SIZE];
+
+    // 写入性能
+    let t0 = benchmark::rdtsc();
+    for i in 0..block_count {
+        BLK.write_block(i, &buf);
+    }
+    let write_cycles = benchmark::rdtsc() - t0;
+
+    // 读取性能
+    let t0 = benchmark::rdtsc();
+    for i in 0..block_count {
+        BLK.read_block(i, &mut buf);
+    }
+    let read_cycles = benchmark::rdtsc() - t0;
+
+    seL4_DebugPutString("  Block size: ");
+    put_u64(BLOCK_SIZE as u64);
+    seL4_DebugPutString(" bytes\n");
+
+    seL4_DebugPutString("  Write ");
+    put_u64(total_bytes as u64);
+    seL4_DebugPutString(" bytes: ");
+    put_u64(write_cycles);
+    seL4_DebugPutString(" cycles (");
+    put_u64(write_cycles / block_count as u64);
+    seL4_DebugPutString(" cycles/block)\n");
+
+    seL4_DebugPutString("  Read  ");
+    put_u64(total_bytes as u64);
+    seL4_DebugPutString(" bytes: ");
+    put_u64(read_cycles);
+    seL4_DebugPutString(" cycles (");
+    put_u64(read_cycles / block_count as u64);
+    seL4_DebugPutString(" cycles/block)\n");
+
+    seL4_DebugPutString("[bench] Block benchmark completed.\n");
+}
+
+fn bench_lwext4_task() {
+    use lwext4_task::{EXT4FSImpl, FSIface};
+
+    seL4_DebugPutString("\n[bench] ext4 filesystem benchmark...\n");
+
+    // 重新初始化 ramdisk（前一个测试修改了文件系统）
+    let ext4_img = include_bytes!("../../blk-task/ext4.img");
+    blk_task::BLK.init_from_image(ext4_img);
+
+    let mut fs = EXT4FSImpl::new();
+    fs.mkdir("/bench");
+
+    let write_sizes: &[usize] = &[512, 1024, 4096];
+    let iterations = 10;
+
+    for &size in write_sizes {
+        let data = alloc::vec![0xA5u8; size];
+
+        // 写入
+        let t0 = benchmark::rdtsc();
+        match fs.open("/bench/test.bin", 0x242) {
+            Ok((inode, _)) => {
+                for _ in 0..iterations {
+                    fs.write_at(inode as u64, 0, &data);
+                }
+                let write_cycles = (benchmark::rdtsc() - t0) / iterations;
+
+                // 读取
+                let mut read_buf = alloc::vec![0u8; size];
+                let t0 = benchmark::rdtsc();
+                for _ in 0..iterations {
+                    fs.read_at(inode as u64, 0, &mut read_buf);
+                }
+                let read_cycles = (benchmark::rdtsc() - t0) / iterations;
+
+                fs.close(inode);
+
+                seL4_DebugPutString("  size=");
+                put_u64(size as u64);
+                seL4_DebugPutString("  write=");
+                put_u64(write_cycles);
+                seL4_DebugPutString("  read=");
+                put_u64(read_cycles);
+                seL4_DebugPutString(" cycles/iter\n");
+            }
+            Err(e) => {
+                seL4_DebugPutString("  open failed: err=");
+                put_u64(e as u64 as u64);
+                seL4_DebugPutString("\n");
+            }
+        }
+        // 清理测试文件
+        fs.unlink("/bench/test.bin");
+    }
+
+    seL4_DebugPutString("[bench] ext4 benchmark completed.\n");
 }
