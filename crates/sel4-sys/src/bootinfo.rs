@@ -10,56 +10,68 @@ use core::fmt;
 // Raw BootInfo layout (matching seL4_BootInfo in the kernel)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of untyped descriptors in the bootinfo.
+pub const MAX_UNTYPED_CAPS: usize = 230;
+
 /// Raw `seL4_BootInfo` structure as provided by the kernel.
 ///
 /// This is a `#[repr(C)]` struct that directly maps to the kernel's binary
-/// layout. It is placed in memory by the kernel loader before the root task
-/// starts.
+/// layout on x86_64. It is placed in memory by the kernel before the root
+/// task starts.
 #[repr(C)]
 pub struct BootInfoRaw {
-    /// ID [0] is an information identifier word. For x86_64, expected to be
-    /// 0xffffff7f (SEL4_BOOTINFO_HEADER_PADDING) or similar.
-    pub extra_len: u32,
-    /// BootInfo ID. Should be `SEL4_BOOTINFO_HEADER_X86_VBE` or equivalent.
-    pub node_id: u32,
-    /// Number of capability slots in the root CNode.
-    pub num_iopt_levels: u32,
-    /// Number of IOAPIC IRQs.
-    pub num_ioapic: u32,
-    /// Offset of IPC buffer CPtr.
-    pub ipc_buffer: u32,
-    /// Empty slots (core has nothing).
-    pub empty: u32,
-    /// Shared frames (core has nothing).
-    pub shared_frames: u32,
-    /// User image frames (core has nothing).
-    pub user_image_frames: u32,
-    /// User image PTs (core has nothing).
-    pub user_image_pts: u32,
-    /// Number of untyped memory regions.
-    pub untyped_list: u32,
-    /// Size of the untyped list (in words).
-    pub untyped_list_size: u32,
-    /// Physical address of the untyped list.
-    pub untyped_list_paddr: u32,
-    /// Number of device regions.
-    pub device_list: u32,
-    /// Size of the device region list.
-    pub device_list_size: u32,
-    /// Physical address of the device region list.
-    pub device_list_paddr: u32,
-    /// Number of IOAPIC structures.
-    pub ioapic_list: u32,
-    /// Size of IOAPIC list.
-    pub ioapic_list_size: u32,
-    /// Physical address of IOAPIC list.
-    pub ioapic_list_paddr: u32,
+    /// Length of any additional bootinfo information (in bytes).
+    pub extra_len: usize,
+    /// Node ID (0 if uniprocessor).
+    pub node_id: usize,
+    /// Number of seL4 nodes (1 if uniprocessor).
+    pub num_nodes: usize,
+    /// Number of IOMMU PT levels (0 if no IOMMU support).
+    pub num_iopt_levels: usize,
+    /// Pointer to initial thread's IPC buffer.
+    pub ipc_buffer: *mut u8,
+    /// Empty slots (null caps).
+    pub empty: SlotRegion,
+    /// Shared-frame caps.
+    pub shared_frames: SlotRegion,
+    /// Userland-image frame caps.
+    pub user_image_frames: SlotRegion,
+    /// Userland-image paging structure caps.
+    pub user_image_paging: SlotRegion,
+    /// IOSpace caps (ARM SMMU).
+    pub io_space_caps: SlotRegion,
+    /// Caps for extra bootinfo pages.
+    pub extra_bi_pages: SlotRegion,
+    /// Root CNode size (2^n slots).
+    pub init_thread_cnode_size_bits: usize,
+    /// Initial thread's domain ID.
+    pub init_thread_domain: usize,
+    /// Untyped-object capability slot range.
+    pub untyped: SlotRegion,
+    /// Information about each untyped capability.
+    pub untyped_list: [UntypedDesc; MAX_UNTYPED_CAPS],
 }
 
-/// BootInfo header ID expected for x86_64.
-pub const SEL4_BOOTINFO_HEADER_X86_VBE: u32 = 0x01000005;
-/// Alternative BootInfo header padding expected on some platforms.
-pub const SEL4_BOOTINFO_HEADER_PADDING: u32 = 0xffffff7f;
+/// A slot region descriptor (start..end range of CNode slots).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SlotRegion {
+    /// First CNode slot position in region.
+    pub start: usize,
+    /// First CNode slot position AFTER region.
+    pub end: usize,
+}
+
+impl SlotRegion {
+    /// Number of slots in this region.
+    pub fn count(&self) -> usize {
+        if self.end > self.start {
+            self.end - self.start
+        } else {
+            0
+        }
+    }
+}
 
 /// Untyped memory descriptor from the bootinfo.
 ///
@@ -135,71 +147,67 @@ impl BootInfo {
         unsafe { &*self.raw }
     }
 
-    /// Get the number of IOAPIC IRQs.
-    pub fn num_ioapic(&self) -> u32 {
-        self.raw().num_ioapic
+    /// Get the untyped slot region (start..end of untyped capability slots).
+    pub fn untyped(&self) -> SlotRegion {
+        self.raw().untyped
     }
 
-    /// Get the number of capability slots in the root CNode.
-    pub fn num_iopt_levels(&self) -> u32 {
-        self.raw().num_iopt_levels
+    /// Get the first untyped capability slot.
+    pub fn untyped_start(&self) -> usize {
+        self.raw().untyped.start
     }
 
-    /// Get the IPC buffer capability pointer.
-    pub fn ipc_buffer_slot(&self) -> u32 {
+    /// Get the number of untyped capabilities.
+    pub fn untyped_count(&self) -> usize {
+        self.raw().untyped.count()
+    }
+
+    /// Get the root CNode size bits.
+    pub fn cnode_size_bits(&self) -> usize {
+        self.raw().init_thread_cnode_size_bits
+    }
+
+    /// Get the IPC buffer pointer.
+    pub fn ipc_buffer(&self) -> *mut u8 {
         self.raw().ipc_buffer
     }
 
-    /// Get the number of untyped memory regions.
-    pub fn untyped_count(&self) -> u32 {
-        self.raw().untyped_list
+    /// Get the node ID.
+    pub fn node_id(&self) -> usize {
+        self.raw().node_id
     }
 
-    /// Get an iterator over the untyped memory descriptors.
-    pub fn untyped_list(&self) -> UntypedIter {
-        let count = self.raw().untyped_list as usize;
-        let ptr = self.raw().untyped_list_paddr as *const UntypedDesc;
-        UntypedIter {
-            ptr,
-            count,
-            index: 0,
+    /// Get the empty slot region (slots available for user allocation).
+    pub fn empty(&self) -> SlotRegion {
+        self.raw().empty
+    }
+
+    /// Get the untyped descriptor for a given index.
+    pub fn untyped_desc(&self, index: usize) -> &UntypedDesc {
+        &self.raw().untyped_list[index]
+    }
+
+    /// Find the first non-device untyped cap that is large enough.
+    /// Returns the (slot, size_bits) of the untyped, or None if not found.
+    pub fn find_free_untyped(&self, min_size_bits: u8) -> Option<(usize, u8)> {
+        let start = self.untyped_start();
+        let count = self.untyped_count();
+        for i in 0..count {
+            let desc = self.untyped_desc(i);
+            if desc.is_device == 0 && desc.size_bits >= min_size_bits {
+                return Some((start + i, desc.size_bits));
+            }
         }
-    }
-
-    /// Get the number of device regions.
-    pub fn device_count(&self) -> u32 {
-        self.raw().device_list
-    }
-
-    /// Get an iterator over the device region descriptors.
-    pub fn device_list(&self) -> DeviceIter {
-        let count = self.raw().device_list as usize;
-        let ptr = self.raw().device_list_paddr as *const DeviceDesc;
-        DeviceIter {
-            ptr,
-            count,
-            index: 0,
-        }
-    }
-
-    /// Get an iterator over the IOAPIC descriptors.
-    pub fn ioapic_list(&self) -> IoApicIter {
-        let count = self.raw().ioapic_list as usize;
-        let ptr = self.raw().ioapic_list_paddr as *const IoApicDesc;
-        IoApicIter {
-            ptr,
-            count,
-            index: 0,
-        }
+        None
     }
 }
 
 impl fmt::Debug for BootInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BootInfo")
-            .field("num_ioapic", &self.num_ioapic())
+            .field("node_id", &self.node_id())
+            .field("untyped_start", &self.untyped_start())
             .field("untyped_count", &self.untyped_count())
-            .field("device_count", &self.device_count())
             .finish()
     }
 }

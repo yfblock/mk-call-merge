@@ -289,55 +289,61 @@ impl VmAttributes {
 
 /// Kernel object types for `seL4_Untyped_Retype`.
 ///
-/// These values are architecture-specific. For x86_64, the encoding is:
+/// Values match the kernel's combined enum (api_object + mode + arch objects).
+/// Chain: non-arch(0..4) → mode(5..7) → arch(8..12)
+/// CONFIG_HUGE_PAGE=1 adds HugePage, CONFIG_IOMMU=1 adds IOPageTable.
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectType {
-    /// 4KiB frame (map as a single page)
-    Frame4K = 0,
-    /// 2MiB large page
-    LargePage = 1,
-    /// Page table (level 3)
-    PageTable = 2,
-    /// Page directory (level 2)
-    PageDirectory = 3,
-    /// PDPT (level 1)
-    PDPT = 4,
-    /// PML4 (level 0, the root page table)
-    PML4 = 5,
-    /// TCB (Thread Control Block)
-    TCB = 6,
-    /// Endpoint
-    Endpoint = 7,
-    /// Notification
-    Notification = 8,
-    /// CNode (capability table)
-    CNode = 9,
-    /// Untyped (raw memory)
-    Untyped = 10,
-    /// ASID Pool
-    ASIDPool = 11,
+    /// Untyped raw memory (retype source).
+    Untyped = 0,
+    /// Thread Control Block.
+    TCB = 1,
+    /// IPC endpoint.
+    Endpoint = 2,
+    /// Async notification object.
+    Notification = 3,
+    /// Capability node (CNode). Size is variable (radix passed as userObjSize).
+    CNode = 4,
+    /// x86_64 PDPT (page directory pointer table).
+    PDPT = 5,
+    /// x86_64 PML4 (page map level 4, root page table).
+    PML4 = 6,
+    /// 1 GiB huge page (CONFIG_HUGE_PAGE).
+    HugePage = 7,
+    /// 4 KiB page frame.
+    Frame4K = 8,
+    /// 2 MiB large page frame.
+    LargePage = 9,
+    /// x86 page table.
+    PageTable = 10,
+    /// x86 page directory.
+    PageDirectory = 11,
+    /// I/O page table (CONFIG_IOMMU).
+    IOPageTable = 12,
 }
 
 impl ObjectType {
     /// Get the size bits for this object type.
     ///
-    /// Size bits = log2(size in bytes). For example, a 4K frame has size_bits
-    /// = 12.
+    /// Size bits = log2(size in bytes). For example, a 4K frame has size_bits = 12.
+    /// For variable-size types (CNode, Untyped), the caller must provide the
+    /// appropriate value — this method returns 0 as a placeholder.
     pub fn size_bits(self) -> usize {
         match self {
-            ObjectType::Frame4K => 12,       // 4 KiB
-            ObjectType::LargePage => 21,     // 2 MiB
-            ObjectType::PageTable => 12,     // 4 KiB
-            ObjectType::PageDirectory => 12, // 4 KiB
-            ObjectType::PDPT => 12,          // 4 KiB
-            ObjectType::PML4 => 12,          // 4 KiB
-            ObjectType::TCB => 11,           // 2 KiB (actually 1<<11)
-            ObjectType::Endpoint => 4,       // 16 bytes
-            ObjectType::Notification => 6,   // 64 bytes (actually depends on config)
-            ObjectType::CNode => 0,          // variable size; size_bits is the radix
             ObjectType::Untyped => 0,        // variable
-            ObjectType::ASIDPool => 12,      // 4 KiB
+            ObjectType::TCB => 11,           // seL4_TCBBits = 11 (2 KiB)
+            ObjectType::Endpoint => 4,       // seL4_EndpointBits = 4 (16 bytes)
+            ObjectType::Notification => 5,   // seL4_NotificationBits = 5 (32 bytes, non-MCS)
+            ObjectType::CNode => 0,          // variable; size_bits is the radix
+            ObjectType::PDPT => 12,          // seL4_PageBits = 12 (4 KiB)
+            ObjectType::PML4 => 12,          // seL4_PageBits = 12 (4 KiB)
+            ObjectType::HugePage => 30,      // seL4_HugePageBits = 30 (1 GiB)
+            ObjectType::Frame4K => 12,       // seL4_PageBits = 12 (4 KiB)
+            ObjectType::LargePage => 21,     // seL4_LargePageBits = 21 (2 MiB)
+            ObjectType::PageTable => 12,     // seL4_PageTableBits = 12 (4 KiB)
+            ObjectType::PageDirectory => 12, // seL4_PageBits = 12 (4 KiB)
+            ObjectType::IOPageTable => 12,   // seL4_IOPageTableBits = 12 (4 KiB)
         }
     }
 }
@@ -559,22 +565,38 @@ impl FaultType {
 /// Well-known capability slot addresses in the initial thread's CSpace.
 ///
 /// These constants reference the slots set up by the kernel for the root task.
-/// The values depend on the kernel configuration and how CSpace is laid out.
+/// Values match `seL4_CapInit*` from `sel4/bootinfo_types.h`.
 pub mod init_slots {
+    /// Null capability (always empty).
+    pub const NULL: usize = 0;
+    /// Root task's TCB.
+    pub const TCB: usize = 1;
     /// CSpace root CNode.
-    pub const CNODE: usize = 1;
+    pub const CNODE: usize = 2;
     /// VSpace root (PML4).
-    pub const VSPACE: usize = 2;
-    /// ASID Pool.
-    pub const ASID_POOL: usize = 3;
+    pub const VSPACE: usize = 3;
     /// IRQ Control.
     pub const IRQ_CONTROL: usize = 4;
     /// ASID Control.
     pub const ASID_CONTROL: usize = 5;
-    /// Root task's TCB.
-    pub const TCB: usize = 6;
-    /// Initial endpoint / notification slots start here.
-    pub const FIRST_FREE: usize = 7;
+    /// ASID Pool.
+    pub const ASID_POOL: usize = 6;
+    /// IOPort Control (x86 only).
+    pub const IO_PORT_CONTROL: usize = 7;
+    /// IO Space (IOMMU, x86 only).
+    pub const IO_SPACE: usize = 8;
+    /// BootInfo frame.
+    pub const BOOT_INFO: usize = 9;
+    /// IPC buffer frame.
+    pub const IPC_BUFFER: usize = 10;
+    /// Domain cap.
+    pub const DOMAIN: usize = 11;
+    /// Scheduling context (MCS only, null otherwise).
+    pub const SC: usize = 14;
+    /// Number of initial capabilities (untyped slots start here).
+    pub const NUM_INITIAL_CAPS: usize = 16;
+    /// First free slot for user allocation (after initial caps).
+    pub const FIRST_FREE: usize = NUM_INITIAL_CAPS + 1;
 }
 
 // ---------------------------------------------------------------------------

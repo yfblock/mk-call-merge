@@ -48,6 +48,7 @@ pub mod bootinfo;
 pub mod error;
 pub mod ipc_buffer;
 pub mod syscalls;
+pub mod tests;
 pub mod types;
 
 // ---------------------------------------------------------------------------
@@ -68,7 +69,6 @@ pub use types::*;
 ///
 /// Each seL4 thread must have a dedicated IPC buffer page. This variable holds
 /// the mutable reference to it, used by all syscall wrappers.
-#[thread_local]
 static mut IPC_BUFFER_PTR: Option<&'static mut IpcBuffer> = None;
 
 /// Set the IPC buffer for the current thread.
@@ -81,6 +81,19 @@ static mut IPC_BUFFER_PTR: Option<&'static mut IpcBuffer> = None;
 pub unsafe fn set_ipc_buffer(buf: &'static mut IpcBuffer) {
     unsafe {
         IPC_BUFFER_PTR = Some(buf);
+    }
+}
+
+/// Get the raw address of the IPC buffer, or 0 if not initialized.
+/// Returns a raw usize address — no reference is created, so no aliasing guarantees apply.
+pub fn ipc_buffer_addr() -> usize {
+    let opt_ptr: *mut Option<&'static mut IpcBuffer> =
+        core::ptr::addr_of_mut!(IPC_BUFFER_PTR);
+    unsafe {
+        match &*opt_ptr {
+            Some(buf) => &**buf as *const IpcBuffer as usize,
+            None => 0,
+        }
     }
 }
 
@@ -110,34 +123,40 @@ where
 
 // ---------------------------------------------------------------------------
 // Constants: seL4 syscall numbers (x86_64)
+//
+// These match the kernel's `enum syscall` in `arch/api/syscall.h`.
+// Note: x86_64 seL4 uses `syscall` instruction. The syscall number goes
+// in RAX (not RDX). The capability goes in RDI, and message info in RSI.
 // ---------------------------------------------------------------------------
 
-/// Syscall number for `seL4_Send`: Blocking send to an endpoint.
-pub const SYS_SEND: isize = -1;
-/// Syscall number for `seL4_NBSend`: Non-blocking send to an endpoint.
-pub const SYS_NBSEND: isize = -2;
 /// Syscall number for `seL4_Call`: Blocking call (send + wait for reply).
-pub const SYS_CALL: isize = -3;
-/// Syscall number for `seL4_Reply`: Send a reply to a pending call.
-pub const SYS_REPLY: isize = -4;
+pub const SYS_CALL: isize = -1;
+/// Syscall number for `seL4_ReplyRecv`: Reply and receive (combined).
+pub const SYS_REPLY_RECV: isize = -2;
+/// Syscall number for `seL4_Send`: Blocking send to an endpoint.
+pub const SYS_SEND: isize = -3;
+/// Syscall number for `seL4_NBSend`: Non-blocking send to an endpoint.
+pub const SYS_NBSEND: isize = -4;
 /// Syscall number for `seL4_Recv`: Blocking receive from an endpoint.
 pub const SYS_RECV: isize = -5;
-/// Syscall number for `seL4_NBRecv`: Non-blocking receive from an endpoint.
-pub const SYS_NBRECV: isize = -6;
+/// Syscall number for `seL4_Reply`: Send a reply to a pending call.
+pub const SYS_REPLY: isize = -6;
 /// Syscall number for `seL4_Yield`: Yield the current timeslice.
 pub const SYS_YIELD: isize = -7;
-/// Syscall number for `seL4_NBWait`: Non-blocking wait on a notification.
-pub const SYS_NBWAIT: isize = -8;
-/// Syscall number for `seL4_Poll`: Poll an endpoint or notification.
-pub const SYS_POLL: isize = -9;
+/// Syscall number for `seL4_NBRecv`: Non-blocking receive from an endpoint.
+pub const SYS_NBRECV: isize = -8;
 /// Syscall number for `seL4_DebugPutChar`: Output a character to kernel debug
 /// serial.
-pub const SYS_DEBUG_PUT_CHAR: isize = -10;
+pub const SYS_DEBUG_PUT_CHAR: isize = -9;
 /// Syscall number for `seL4_DebugDumpScheduler`: Dump scheduler state (debug).
-pub const SYS_DEBUG_DUMP_SCHEDULER: isize = -11;
+pub const SYS_DEBUG_DUMP_SCHEDULER: isize = -10;
+/// Syscall number for `seL4_DebugHalt`: Halt the kernel (shutdown).
+pub const SYS_DEBUG_HALT: isize = -11;
+/// Syscall number for `seL4_Signal`: Signal a notification object.
+pub const SYS_SIGNAL: isize = -12;
 /// Syscall number for `seL4_SetTLSBase`: Set the TLS base register (FS base on
 /// x86_64) for the current thread.
-pub const SYS_SET_TLS_BASE: isize = -12;
+pub const SYS_SET_TLS_BASE: isize = -29;
 
 // ---------------------------------------------------------------------------
 // Core syscall ABI: the actual `syscall` instruction
@@ -150,8 +169,8 @@ pub const SYS_SET_TLS_BASE: isize = -12;
 ///
 /// - `r14` ← `rsp` (save user stack pointer, clobbered by kernel)
 /// - `rdx` ← syscall number
-/// - `rdi` ← `arg0` (msg[0])
-/// - `rsi` ← `arg1` (msg[1] / capability pointer)
+/// - `rdi` ← `arg0` (capability dest/src)
+/// - `rsi` ← `arg1` (message info / tag)
 /// - `r10` ← `arg2` (msg[2])
 /// - `r8`  ← `arg3` (msg[3])
 /// - `r9`  ← `arg4` (msg[4])
@@ -162,8 +181,8 @@ pub const SYS_SET_TLS_BASE: isize = -12;
 /// After `syscall`:
 ///
 /// - `rax`  ← status / result
-/// - `rdi`  ← msg[0] (output)
-/// - `rsi`  ← msg[1] (output)
+/// - `rdi`  ← cap register (output)
+/// - `rsi`  ← badge (output)
 /// - `r10`  ← msg[2] (output)
 /// - `r8`   ← msg[3] (output)
 /// - `r9`   ← msg[4] (output)
@@ -190,15 +209,14 @@ unsafe fn seL4_syscall(
     arg6: usize,
     arg7: usize,
 ) -> (usize, usize, usize, usize, usize, usize, usize, usize, usize) {
-    let mut out0: usize;
-    let mut out1: usize;
-    let mut out2: usize;
-    let mut out3: usize;
-    let mut out4: usize;
-    let mut out5: usize;
-    let mut out6: usize;
-    let mut out7: usize;
-    let mut status: usize;
+    let mut tag: usize;
+    let mut badge: usize;
+    let mut mr0: usize;
+    let mut mr1: usize;
+    let mut mr2: usize;
+    let mut mr3: usize;
+    let mut _r12: usize;
+    let mut _r13: usize;
 
     unsafe {
         core::arch::asm!(
@@ -220,27 +238,104 @@ unsafe fn seL4_syscall(
             in("r13") arg6,
             in("r15") arg7,
 
-            // Outputs
-            lateout("rax") status,
-            lateout("rdi") out0,
-            lateout("rsi") out1,
-            lateout("r10") out2,
-            lateout("r8")  out3,
-            lateout("r9")  out4,
-            lateout("r12") out5,
-            lateout("r13") out6,
-            lateout("r15") out7,
+            // Outputs — kernel return register mapping (from registerset.h):
+            // RDI = badge (badgeRegister = 0)
+            // RSI = msgInfo (msgInfoRegister = 1)
+            // R10, R8, R9, R15 = message registers MR[0..3]
+            lateout("rax") _,
+            lateout("rdi") badge,
+            lateout("rsi") tag,
+            lateout("r10") mr0,
+            lateout("r8")  mr1,
+            lateout("r9")  mr2,
+            lateout("r12") _r12,
+            lateout("r13") _r13,
+            lateout("r15") mr3,
 
             // Clobbers (syscall/sysret clobber these)
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
 
-            options(nomem, nostack),
+            options(nostack),
         );
     }
 
-    (status, out0, out1, out2, out3, out4, out5, out6, out7)
+    (0, tag, badge, mr0, mr1, mr2, mr3, 0, 0)
+}
+
+/// Write MR4-MR9 to the IPC buffer, then execute a seL4 syscall.
+///
+/// The kernel's `getSyscallArg(i, buffer)` reads `buffer[i+1]` where
+/// `buffer` points to `&(ipcBuffer->tag)` (the start of the struct).
+/// Since `msg[0]` is at word offset 1 from the struct start:
+///   `buffer[i+1]` = `msg[i]` (byte offset `(i+1)*8` from struct start).
+///
+/// `buf_addr` = `ipc_buffer_addr() + 8` = address of `msg[0]`.
+/// So to write `msg[i]`, use `buf_addr + i*8`.
+#[inline(always)]
+pub(crate) unsafe fn seL4_syscall_with_buf(
+    sys: isize,
+    arg0: usize, arg1: usize, arg2: usize, arg3: usize,
+    arg4: usize, arg5: usize, arg6: usize, arg7: usize,
+    buf_addr: usize,
+    mr4: usize, mr5: usize, mr6: usize, mr7: usize, mr8: usize, mr9: usize,
+) -> (usize, usize, usize, usize, usize, usize, usize, usize, usize) {
+    unsafe {
+        // buf_addr = &msg[0]. Write msg[i] = buf_addr + i*8.
+        // getSyscallArg(4) reads msg[4], getSyscallArg(5) reads msg[5], etc.
+        core::ptr::write_volatile((buf_addr + 32) as *mut usize, mr4);  // msg[4]
+        core::ptr::write_volatile((buf_addr + 40) as *mut usize, mr5);  // msg[5]
+        core::ptr::write_volatile((buf_addr + 48) as *mut usize, mr6);  // msg[6]
+        core::ptr::write_volatile((buf_addr + 56) as *mut usize, mr7);  // msg[7]
+        core::ptr::write_volatile((buf_addr + 64) as *mut usize, mr8);  // msg[8]
+        core::ptr::write_volatile((buf_addr + 72) as *mut usize, mr9);  // msg[9]
+        // Hardware memory fence + compiler barrier.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        seL4_syscall(sys, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+    }
+}
+
+/// Write extra caps and MR4-MR9 to the IPC buffer, then execute a seL4 syscall.
+///
+/// Extra caps are written to `caps_or_badges[]` at byte offsets 976, 984, 992
+/// from the IPC buffer start (i.e., `buf_addr + 976 + i*8`).
+#[inline(always)]
+pub(crate) unsafe fn seL4_syscall_with_caps(
+    sys: isize,
+    arg0: usize, arg1: usize, arg2: usize, arg3: usize,
+    arg4: usize, arg5: usize, arg6: usize, arg7: usize,
+    buf_addr: usize,
+    mr4: usize, mr5: usize, mr6: usize, mr7: usize, mr8: usize, mr9: usize,
+    num_caps: usize, cap0: usize, cap1: usize, cap2: usize,
+) -> (usize, usize, usize, usize, usize, usize, usize, usize, usize) {
+    unsafe {
+        // Write extra caps to IPC buffer caps_or_badges[0..2].
+        // caps_or_badges is at byte offset 976 from buffer start (&tag).
+        if num_caps >= 1 {
+            core::ptr::write_volatile((buf_addr + 976) as *mut usize, cap0);
+        }
+        if num_caps >= 2 {
+            core::ptr::write_volatile((buf_addr + 984) as *mut usize, cap1);
+        }
+        if num_caps >= 3 {
+            core::ptr::write_volatile((buf_addr + 992) as *mut usize, cap2);
+        }
+        // Write MR4-MR9 to IPC buffer msg[] area.
+        // msg[] starts at byte offset 8 from buffer start.
+        let msg = buf_addr + 8;
+        core::ptr::write_volatile((msg + 32) as *mut usize, mr4);
+        core::ptr::write_volatile((msg + 40) as *mut usize, mr5);
+        core::ptr::write_volatile((msg + 48) as *mut usize, mr6);
+        core::ptr::write_volatile((msg + 56) as *mut usize, mr7);
+        core::ptr::write_volatile((msg + 64) as *mut usize, mr8);
+        core::ptr::write_volatile((msg + 72) as *mut usize, mr9);
+        // Hardware memory fence + compiler barrier.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        seL4_syscall(sys, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+    }
 }
 
 /// Execute a raw seL4 system call with no arguments (only the syscall number).
@@ -257,7 +352,7 @@ pub unsafe fn sys_null(sys: isize) {
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
 }
@@ -279,7 +374,7 @@ pub unsafe fn sys_send1(sys: isize, a0: usize) -> (usize, usize) {
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0)
@@ -305,7 +400,7 @@ pub unsafe fn sys_send2(sys: isize, a0: usize, a1: usize) -> (usize, usize, usiz
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0, out1)
@@ -339,7 +434,7 @@ pub unsafe fn sys_send3(
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0, out1, out2)
@@ -377,7 +472,7 @@ pub unsafe fn sys_send4(
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0, out1, out2, out3)
@@ -419,7 +514,7 @@ pub unsafe fn sys_send5(
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0, out1, out2, out3, out4)
@@ -465,7 +560,7 @@ pub unsafe fn sys_send6(
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (status, out0, out1, out2, out3, out4, out5)

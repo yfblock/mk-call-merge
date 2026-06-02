@@ -15,19 +15,23 @@ use crate::types::{IPC_BUFFER_MSG_REGS, UserContext};
 ///
 /// # Layout
 ///
-/// The buffer is laid out in memory as:
+/// The buffer is laid out in memory as (matching kernel's `seL4_IPCBuffer`):
+/// - `tag`: MessageInfo word (set by kernel on receive)
 /// - `msg[0..120]`: Extended message registers (word-sized)
 /// - `user_data`: Free-form user data word
-/// - `caps_or_badges[0..3]`: Capability transfer info
+/// - `caps_or_badges[0..3]`: Capability transfer / badge info
 /// - `receive_cnode`, `receive_index`, `receive_depth`: Capability receive slot
 ///
 /// Total size: 4096 bytes (one page).
 #[repr(C, align(4096))]
 pub struct IpcBuffer {
+    /// MessageInfo tag — set by the kernel on receive, ignored on send.
+    pub tag: usize,
+
     /// Message registers beyond those in CPU registers.
     ///
-    /// On x86_64, CPU registers carry MR0-MR5 (rdi, rsi, r10, r8, r9, r12).
-    /// Additional MRs (6..) are read from this array when the message info
+    /// On x86_64, CPU registers carry MR0-MR3 (r10, r8, r9, r15).
+    /// Additional MRs (4..) are read from this array when the message info
     /// `length` exceeds the number of physical registers.
     pub msg: [usize; IPC_BUFFER_MSG_REGS],
 
@@ -35,6 +39,8 @@ pub struct IpcBuffer {
     pub user_data: usize,
 
     /// Capability transfer / badge info words.
+    /// `caps_or_badges[0]` is the first extra cap (kernel reads from
+    /// `bufferPtr[seL4_MsgMaxLength + 2 + i]`).
     pub caps_or_badges: [usize; 3],
 
     /// CNode to receive capabilities into.
@@ -52,10 +58,11 @@ pub struct IpcBuffer {
 
 /// Calculate padding bytes to fill the IPC buffer to exactly one page.
 const IPC_BUFFER_PADDING: usize = {
-    let header_size = IPC_BUFFER_MSG_REGS * 8  // msg array
-        + 8                                     // user_data
-        + 3 * 8                                 // caps_or_badges
-        + 3 * 8;                                // receive fields
+    let header_size = 8                                     // tag
+        + IPC_BUFFER_MSG_REGS * 8                           // msg array
+        + 8                                                 // user_data
+        + 3 * 8                                             // caps_or_badges
+        + 3 * 8;                                            // receive fields
     crate::types::IPC_BUFFER_SIZE - header_size
 };
 
@@ -63,6 +70,7 @@ impl IpcBuffer {
     /// Create a zero-initialized IPC buffer.
     pub const fn new() -> Self {
         Self {
+            tag: 0,
             msg: [0; IPC_BUFFER_MSG_REGS],
             user_data: 0,
             caps_or_badges: [0; 3],

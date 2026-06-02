@@ -1,11 +1,9 @@
 //! High-level seL4 system call wrappers.
-//!
-//! ... (see module doc)
 
 use crate::{
-    sys_null, with_ipc_buffer, SYS_CALL, SYS_DEBUG_DUMP_SCHEDULER,
-    SYS_DEBUG_PUT_CHAR, SYS_NBSEND, SYS_NBWAIT, SYS_POLL, SYS_RECV, SYS_REPLY, SYS_SEND,
-    SYS_SET_TLS_BASE, SYS_YIELD,
+    sys_null, ipc_buffer_addr, SYS_CALL, SYS_DEBUG_DUMP_SCHEDULER, SYS_DEBUG_HALT,
+    SYS_DEBUG_PUT_CHAR, SYS_NBSEND, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
+    SYS_SEND, SYS_SET_TLS_BASE, SYS_SIGNAL, SYS_YIELD,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,7 +16,7 @@ use crate::{
 /// the receiving endpoint (0 if unbadged).
 pub fn seL4_Send(dest: usize, info: usize) -> (usize, usize) {
     unsafe {
-        let (_status, tag, badge) = crate::sys_send2(SYS_SEND, info, dest);
+        let (_status, tag, badge) = crate::sys_send2(SYS_SEND, dest, info);
         (tag, badge)
     }
 }
@@ -26,18 +24,21 @@ pub fn seL4_Send(dest: usize, info: usize) -> (usize, usize) {
 /// Non-blocking send to a capability.
 pub fn seL4_NBSend(dest: usize, info: usize) -> (usize, usize) {
     unsafe {
-        let (_status, tag, badge) = crate::sys_send2(SYS_NBSEND, info, dest);
+        let (_status, tag, badge) = crate::sys_send2(SYS_NBSEND, dest, info);
         (tag, badge)
     }
 }
 
 /// Blocking call: send to an endpoint and wait for a reply.
 ///
-/// Returns `(status, tag)` where `status == 0` means success.
+/// Returns `(error, tag)` where `error == 0` means success.
+/// The error code is extracted from the tag's label field (bits 12..).
 pub fn seL4_Call(dest: usize, info: usize) -> (usize, usize) {
     unsafe {
-        let (status, tag, _badge) = crate::sys_send2(SYS_CALL, info, dest);
-        (status, tag)
+        let (_status, tag, _badge) = crate::sys_send2(SYS_CALL, dest, info);
+        // Kernel returns error in tag's label field. RAX is always 0 for Call.
+        let error = tag >> 12;
+        (error, tag)
     }
 }
 
@@ -68,46 +69,7 @@ pub fn seL4_NBRecv(src: usize) -> (usize, usize) {
 
 /// Blocking reply-and-receive (combined in one syscall).
 pub fn seL4_ReplyRecv(dest: usize, info: usize, src: usize) -> (usize, usize) {
-    let mut status: usize;
-    let mut badge: usize;
-    unsafe {
-        core::arch::asm!(
-            "mov r14, rsp",
-            "syscall",
-            "mov rsp, r14",
-            in("rdx") -2isize,  // ReplyRecv syscall number
-            in("rdi") info,
-            in("rsi") dest,
-            in("r10") src,
-            lateout("rax") status,
-            lateout("rsi") badge,
-            lateout("rcx") _,
-            lateout("r11") _,
-            lateout("r14") _,
-            options(nomem, nostack),
-        );
-    }
-    (status, badge)
-}
-
-// ---------------------------------------------------------------------------
-// Notification syscalls
-// ---------------------------------------------------------------------------
-
-/// Non-blocking wait on a notification object.
-///
-/// Returns `(state, badge)`. If `state != 0`, the notification was signaled.
-pub fn seL4_NBWait(ntfn: usize) -> (usize, usize) {
-    unsafe {
-        let (state, badge, _) = crate::sys_send2(SYS_NBWAIT, ntfn, 0);
-        (state, badge)
-    }
-}
-
-/// Poll an endpoint or notification object without blocking.
-///
-/// Returns `(tag_or_state, badge)`.
-pub fn seL4_Poll(obj: usize) -> (usize, usize) {
+    let mut _badge_rax: usize;
     let mut tag: usize;
     let mut badge: usize;
     unsafe {
@@ -115,14 +77,17 @@ pub fn seL4_Poll(obj: usize) -> (usize, usize) {
             "mov r14, rsp",
             "syscall",
             "mov rsp, r14",
-            in("rdx") SYS_POLL,
-            in("rdi") obj,
-            lateout("rax") tag,
+            in("rdx") SYS_REPLY_RECV,
+            in("rdi") dest,
+            in("rsi") info,
+            in("r10") src,
+            lateout("rax") _badge_rax,
+            lateout("rdi") tag,
             lateout("rsi") badge,
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     (tag, badge)
@@ -139,6 +104,23 @@ pub fn seL4_Yield() {
     }
 }
 
+/// Signal a notification object (non-blocking).
+pub fn seL4_Signal(dest: usize) {
+    unsafe {
+        crate::sys_send1(SYS_SIGNAL, dest);
+    }
+}
+
+/// Wait on a notification object (blocking).
+///
+/// Returns the badge of the notification that was signaled.
+pub fn seL4_Wait(src: usize) -> usize {
+    unsafe {
+        let (badge, _) = crate::sys_send1(SYS_RECV, src);
+        badge
+    }
+}
+
 /// Output a single character to the kernel's debug serial port.
 pub fn seL4_DebugPutChar(c: u8) {
     unsafe {
@@ -151,7 +133,7 @@ pub fn seL4_DebugPutChar(c: u8) {
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
 }
@@ -167,6 +149,13 @@ pub fn seL4_DebugPutString(s: &str) {
 pub fn seL4_DebugDumpScheduler() {
     unsafe {
         sys_null(SYS_DEBUG_DUMP_SCHEDULER);
+    }
+}
+
+/// Halt the kernel and shut down the system.
+pub fn seL4_DebugHalt() {
+    unsafe {
+        sys_null(SYS_DEBUG_HALT);
     }
 }
 
@@ -186,42 +175,91 @@ pub fn seL4_SetTLSBase(addr: usize) -> (usize, usize) {
 // `label` field selects the operation, and the `length` field tells the kernel
 // how many message registers to read.
 //
-// Message registers (MRs) are laid out as follows:
-//   MR0 = rdi (used as the tag for Call)
-//   MR1 = rsi (destination CPtr for Call)
-//   MR2..MR5 = r10, r8, r9, r12
-//   MR6+ = IPC buffer msg[] array
-//
-// The `build_call` helper writes MRs beyond the first 2 into the IPC buffer
-// and performs the call.
+// Message registers (MRs) on x86_64:
+//   CPU: r10=MR0, r8=MR1, r9=MR2, r15=MR3
+//   IPC buffer msg[4..]: MR4+
 
 /// Prepare the IPC buffer for a capability invocation and execute `seL4_Call`.
 ///
-/// Returns the raw status word (0 = success).
+/// Returns 0 on success, or an error code on failure.
+///
+/// seL4 Call invocation reply convention:
+/// - Success: reply tag label = 0
+/// - Error: reply tag label = seL4 error code (non-zero)
 fn cap_invoke(dest: usize, label: u32, mrs: &[usize]) -> usize {
-    // Build the MessageInfo word: (label << 12) | (length << 7)
-    let info = (label as usize) << 12 | (mrs.len() << 7);
+    let total_mrs = mrs.len();
+    let info = (label as usize) << 12 | total_mrs;
 
-    // Write MRs into the IPC buffer (after the tag which is MR0 and dest
-    // which is MR1). Actually, for seL4_Call, the first two message registers
-    // are the tag (MR0) and the destination (MR1). The kernel reads MR2+ from
-    // the IPC buffer when the length exceeds what fits in registers.
-    //
-    // For x86_64, MR0..MR5 can be passed in registers. MR6+ must use the IPC
-    // buffer. Since we pass the tag and dest as separate operands to the
-    // syscall, we need to write the remaining message words to the IPC
-    // buffer starting at msg[0].
-    if !mrs.is_empty() {
-        with_ipc_buffer(|ipc_buf| {
-            for (i, &mr) in mrs.iter().enumerate() {
-                ipc_buf.write_mr(i, mr);
-            }
-        });
+    // CPU registers carry MR0-MR3: r10=MR0, r8=MR1, r9=MR2, r15=MR3.
+    // MR4-MR9 go into the IPC buffer msg[4..9].
+    // MR10+ are written directly to the IPC buffer msg[10+].
+    let r10 = if total_mrs > 0 { mrs[0] } else { 0 };
+    let r8  = if total_mrs > 1 { mrs[1] } else { 0 };
+    let r9  = if total_mrs > 2 { mrs[2] } else { 0 };
+    let r15 = if total_mrs > 3 { mrs[3] } else { 0 };
+    let mr4 = if total_mrs > 4  { mrs[4] } else { 0 };
+    let mr5 = if total_mrs > 5  { mrs[5] } else { 0 };
+    let mr6 = if total_mrs > 6  { mrs[6] } else { 0 };
+    let mr7 = if total_mrs > 7  { mrs[7] } else { 0 };
+    let mr8 = if total_mrs > 8  { mrs[8] } else { 0 };
+    let mr9 = if total_mrs > 9  { mrs[9] } else { 0 };
+    let buf_addr = ipc_buffer_addr() + 8; // msg[] starts at byte offset 8
+
+    // Write MR10+ directly to the IPC buffer (seL4_syscall_with_buf only handles MR4-MR9).
+    unsafe {
+        for i in 10..total_mrs.min(120) {
+            core::ptr::write_volatile((buf_addr + i * 8) as *mut usize, mrs[i]);
+        }
     }
 
-    // Execute the call
-    let (status, _tag) = seL4_Call(dest, info);
-    status
+    let (_zero, tag, _badge, _mr0, _, _, _, _, _) = unsafe {
+        crate::seL4_syscall_with_buf(
+            crate::SYS_CALL, dest, info, r10, r8, r9, 0, 0, r15,
+            buf_addr, mr4, mr5, mr6, mr7, mr8, mr9,
+        )
+    };
+    tag >> 12
+}
+
+/// Like `cap_invoke` but also passes extra capabilities via the IPC buffer.
+///
+/// Extra caps go into caps_or_badges[0], caps_or_badges[1], ...
+/// (kernel reads from bufferPtr[seL4_MsgMaxLength + 2 + i] = caps_or_badges[i])
+fn cap_invoke_with_extra(
+    dest: usize,
+    label: u32,
+    mrs: &[usize],
+    extra_caps: &[usize],
+) -> usize {
+    let total_mrs = mrs.len();
+    let info = (label as usize) << 12 | (extra_caps.len() << 7) | total_mrs;
+
+    // CPU registers carry MR0-MR3. MR4-MR9 go into the IPC buffer.
+    let r10 = if total_mrs > 0 { mrs[0] } else { 0 };
+    let r8  = if total_mrs > 1 { mrs[1] } else { 0 };
+    let r9  = if total_mrs > 2 { mrs[2] } else { 0 };
+    let r15 = if total_mrs > 3 { mrs[3] } else { 0 };
+    let mr4 = if total_mrs > 4 { mrs[4] } else { 0 };
+    let mr5 = if total_mrs > 5 { mrs[5] } else { 0 };
+    let mr6 = if total_mrs > 6 { mrs[6] } else { 0 };
+    let mr7 = if total_mrs > 7 { mrs[7] } else { 0 };
+    let mr8 = if total_mrs > 8 { mrs[8] } else { 0 };
+    let mr9 = if total_mrs > 9 { mrs[9] } else { 0 };
+
+    let cap0 = if extra_caps.len() > 0 { extra_caps[0] } else { 0 };
+    let cap1 = if extra_caps.len() > 1 { extra_caps[1] } else { 0 };
+    let cap2 = if extra_caps.len() > 2 { extra_caps[2] } else { 0 };
+    let num_caps = extra_caps.len();
+    let buf_addr = ipc_buffer_addr();
+
+    let (_zero, tag, _badge, _mr0, _, _, _, _, _) = unsafe {
+        crate::seL4_syscall_with_caps(
+            crate::SYS_CALL, dest, info, r10, r8, r9, 0, 0, r15,
+            buf_addr, mr4, mr5, mr6, mr7, mr8, mr9,
+            num_caps, cap0, cap1, cap2,
+        )
+    };
+    tag >> 12
 }
 
 // ---------------------------------------------------------------------------
@@ -239,21 +277,27 @@ pub fn seL4_TCB_Configure(
     ipc_buffer_addr: usize,
     ipc_buffer_cap: usize,
 ) -> usize {
-    cap_invoke(
+    cap_invoke_with_extra(
         tcb,
-        1, // TCBConfigure label
+        5, // TCBConfigure label
         &[
             fault_ep,
-            cspace_root,
             cspace_root_data,
-            vspace_root,
+            0, // vspace_root_data (unused)
             ipc_buffer_addr,
-            ipc_buffer_cap,
         ],
+        &[cspace_root, vspace_root, ipc_buffer_cap],
     )
 }
 
 /// Write all registers for a TCB (set initial thread context).
+///
+/// The `reg_frame` slice contains register values in the kernel's
+/// `frameRegisters[]` order: FaultIP, RSP, FLAGS, RAX, RBX, RCX, RDX,
+/// RSI, RDI, RBP, R8, R9, R10, R11, R12, R13, R14, R15.
+///
+/// MR layout: MR0 = resume (with archFlags in upper bits), MR1 = count,
+/// MR2.. = register values.
 pub fn seL4_TCB_WriteRegisters(
     tcb: usize,
     resume: bool,
@@ -261,19 +305,16 @@ pub fn seL4_TCB_WriteRegisters(
     count: u8,
     reg_frame: &[usize],
 ) -> usize {
-    with_ipc_buffer(|ipc_buf| {
-        // Write the header: resume, arch_flags, count
-        ipc_buf.write_mr(0, resume as usize);
-        ipc_buf.write_mr(1, arch_flags as usize);
-        ipc_buf.write_mr(2, count as usize);
-        // Write register values
-        for (i, &val) in reg_frame.iter().enumerate() {
-            ipc_buf.write_mr(3 + i, val);
-        }
-    });
-    let info = (2usize << 12) | ((3 + reg_frame.len()) << 7);
-    let (status, _tag) = seL4_Call(tcb, info);
-    status
+    // Kernel decode: flags = getSyscallArg(0), w = getSyscallArg(1)
+    // flags & BIT(0) = resume, w = number of registers to write.
+    // Then getSyscallArg(2+i) = frameRegisters[i].
+    let flags = (resume as usize) | ((arch_flags as usize) << 8);
+    let n = reg_frame.len().min(count as usize);
+    let mut mrs = [0usize; 2 + 18]; // MR0=flags, MR1=count, MR2..=regs
+    mrs[0] = flags;
+    mrs[1] = n;
+    mrs[2..2 + n].copy_from_slice(&reg_frame[..n]);
+    cap_invoke(tcb, 3, &mrs[..2 + n]) // TCBWriteRegisters label = 3
 }
 
 /// Set scheduling parameters for a TCB.
@@ -283,26 +324,27 @@ pub fn seL4_TCB_SetSchedParams(
     mcp: u8,
     priority: u8,
 ) -> usize {
-    cap_invoke(
+    cap_invoke_with_extra(
         tcb,
-        4, // TCBSetSchedParams label
-        &[authority, mcp as usize, priority as usize],
+        8, // TCBSetSchedParams label
+        &[mcp as usize, priority as usize],
+        &[authority],
     )
 }
 
 /// Bind a notification object to a TCB (for fault or signal delivery).
 pub fn seL4_TCB_BindNotification(tcb: usize, ntfn: usize) -> usize {
-    cap_invoke(tcb, 5, &[ntfn]) // TCBBindNotification label
+    cap_invoke_with_extra(tcb, 13, &[], &[ntfn]) // TCBBindNotification label
 }
 
 /// Unbind a notification from a TCB.
 pub fn seL4_TCB_UnbindNotification(tcb: usize) -> usize {
-    cap_invoke(tcb, 6, &[]) // TCBUnbindNotification label
+    cap_invoke(tcb, 14, &[]) // TCBUnbindNotification label
 }
 
 /// Set the TLS base address for a TCB.
 pub fn seL4_TCB_SetTLSBase(tcb: usize, tls_base: usize) -> usize {
-    cap_invoke(tcb, 7, &[tls_base]) // TCBSetTLSBase label
+    cap_invoke(tcb, 15, &[tls_base]) // TCBSetTLSBase label
 }
 
 // ---------------------------------------------------------------------------
@@ -319,17 +361,17 @@ pub fn seL4_CNode_Copy(
     src_depth: u8,
     rights: usize,
 ) -> usize {
-    cap_invoke(
+    cap_invoke_with_extra(
         cnode,
-        1, // CNodeCopy label
+        20, // CNodeCopy label
         &[
             dest_index,
             dest_depth as usize,
-            src_root,
             src_index,
             src_depth as usize,
             rights,
         ],
+        &[src_root],
     )
 }
 
@@ -344,29 +386,29 @@ pub fn seL4_CNode_Mint(
     rights: usize,
     badge: usize,
 ) -> usize {
-    cap_invoke(
+    cap_invoke_with_extra(
         cnode,
-        2, // CNodeMint label
+        21, // CNodeMint label
         &[
             dest_index,
             dest_depth as usize,
-            src_root,
             src_index,
             src_depth as usize,
             rights,
             badge,
         ],
+        &[src_root],
     )
 }
 
 /// Delete a capability from a slot.
 pub fn seL4_CNode_Delete(cnode: usize, index: usize, depth: u8) -> usize {
-    cap_invoke(cnode, 5, &[index, depth as usize]) // CNodeDelete label
+    cap_invoke(cnode, 18, &[index, depth as usize]) // CNodeDelete label
 }
 
 /// Revoke all capabilities derived from a slot.
 pub fn seL4_CNode_Revoke(cnode: usize, index: usize, depth: u8) -> usize {
-    cap_invoke(cnode, 6, &[index, depth as usize]) // CNodeRevoke label
+    cap_invoke(cnode, 17, &[index, depth as usize]) // CNodeRevoke label
 }
 
 // ---------------------------------------------------------------------------
@@ -384,18 +426,20 @@ pub fn seL4_Untyped_Retype(
     node_offset: usize,
     num_objects: usize,
 ) -> usize {
-    cap_invoke(
+    // root_cnode is passed as an extra cap (caps_or_badges[0]), not as an MR.
+    // MRs: [obj_type, size_bits, node_index, node_depth, node_offset, num_objects]
+    cap_invoke_with_extra(
         untyped,
         1, // UntypedRetype label
         &[
             obj_type,
             size_bits,
-            root_cnode,
             node_index,
             node_depth,
             node_offset,
             num_objects,
         ],
+        &[root_cnode],
     )
 }
 
@@ -411,12 +455,12 @@ pub fn seL4_Frame_Map(
     rights: usize,
     attr: usize,
 ) -> usize {
-    cap_invoke(frame, 0, &[vspace, vaddr, rights, attr]) // X86PageMap label
+    cap_invoke_with_extra(frame, 41, &[vaddr, rights, attr], &[vspace]) // X86PageMap label
 }
 
 /// Unmap a frame from all address spaces.
 pub fn seL4_Frame_Unmap(frame: usize) -> usize {
-    cap_invoke(frame, 1, &[]) // X86PageUnmap label
+    cap_invoke(frame, 42, &[]) // X86PageUnmap label
 }
 
 // ---------------------------------------------------------------------------
@@ -425,12 +469,12 @@ pub fn seL4_Frame_Unmap(frame: usize) -> usize {
 
 /// Map a page table into a parent page table.
 pub fn seL4_PageTable_Map(pt: usize, vspace: usize, vaddr: usize, attr: usize) -> usize {
-    cap_invoke(pt, 0, &[vspace, vaddr, attr]) // X86PageTableMap label
+    cap_invoke_with_extra(pt, 37, &[vaddr, attr], &[vspace]) // X86PageTableMap label
 }
 
 /// Unmap a page table.
 pub fn seL4_PageTable_Unmap(pt: usize) -> usize {
-    cap_invoke(pt, 1, &[]) // X86PageTableUnmap label
+    cap_invoke(pt, 38, &[]) // X86PageTableUnmap label
 }
 
 // ---------------------------------------------------------------------------
@@ -444,12 +488,12 @@ pub fn seL4_PageDirectory_Map(
     vaddr: usize,
     attr: usize,
 ) -> usize {
-    cap_invoke(pd, 0, &[vspace, vaddr, attr]) // X86PageDirectoryMap label
+    cap_invoke_with_extra(pd, 33, &[vaddr, attr], &[vspace]) // X86PageDirectoryMap label
 }
 
 /// Unmap a page directory.
 pub fn seL4_PageDirectory_Unmap(pd: usize) -> usize {
-    cap_invoke(pd, 1, &[]) // X86PageDirectoryUnmap label
+    cap_invoke(pd, 34, &[]) // X86PageDirectoryUnmap label
 }
 
 // ---------------------------------------------------------------------------
@@ -458,12 +502,12 @@ pub fn seL4_PageDirectory_Unmap(pd: usize) -> usize {
 
 /// Map a PDPT into a PML4.
 pub fn seL4_PDPT_Map(pdpt: usize, vspace: usize, vaddr: usize, attr: usize) -> usize {
-    cap_invoke(pdpt, 0, &[vspace, vaddr, attr]) // X86PDPTMap label
+    cap_invoke_with_extra(pdpt, 33, &[vaddr, attr], &[vspace]) // X86PDPTMap label (same enum value as PageDirectoryMap)
 }
 
 /// Unmap a PDPT.
 pub fn seL4_PDPT_Unmap(pdpt: usize) -> usize {
-    cap_invoke(pdpt, 1, &[]) // X86PDPTUnmap label
+    cap_invoke(pdpt, 34, &[]) // X86PDPTUnmap label (same enum value as PageDirectoryUnmap)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +516,7 @@ pub fn seL4_PDPT_Unmap(pdpt: usize) -> usize {
 
 /// Assign an ASID to a VSpace.
 pub fn seL4_ASIDPool_Assign(asid_pool: usize, vspace: usize) -> usize {
-    cap_invoke(asid_pool, 0, &[vspace]) // X86ASIDPoolAssign label
+    cap_invoke(asid_pool, 46, &[vspace]) // X86ASIDPoolAssign label
 }
 
 /// Create an ASID pool from untyped memory.
@@ -483,10 +527,11 @@ pub fn seL4_ASIDControl_MakePool(
     index: usize,
     depth: usize,
 ) -> usize {
-    cap_invoke(
+    cap_invoke_with_extra(
         asid_control,
-        0, // X86ASIDControlMakePool label
-        &[untyped, root_cnode, index, depth],
+        45, // X86ASIDControlMakePool label
+        &[index, depth],
+        &[untyped, root_cnode],
     )
 }
 
@@ -502,15 +547,53 @@ pub fn seL4_IRQControl_Get(
     index: usize,
     depth: usize,
 ) -> usize {
-    cap_invoke(irq_control, 0, &[irq, root_cnode, index, depth])
+    cap_invoke_with_extra(irq_control, 26, &[irq, index, depth], &[root_cnode]) // IRQIssueIRQHandler
 }
 
 /// Set the notification that an IRQ handler will signal when the IRQ fires.
 pub fn seL4_IRQHandler_SetNotification(irq_handler: usize, notification: usize) -> usize {
-    cap_invoke(irq_handler, 1, &[notification])
+    cap_invoke(irq_handler, 28, &[notification]) // IRQSetIRQHandler
 }
 
 /// Acknowledge an IRQ (re-enable it after handling).
 pub fn seL4_IRQHandler_Ack(irq_handler: usize) -> usize {
-    cap_invoke(irq_handler, 0, &[])
+    cap_invoke(irq_handler, 27, &[]) // IRQAckIRQ
+}
+
+// ---------------------------------------------------------------------------
+// x86 I/O Port operations
+// ---------------------------------------------------------------------------
+
+/// Issue (create) an I/O port capability for a port range.
+///
+/// The new capability is stored in `dest_index` of the `dest_cnode`.
+pub fn seL4_X86_IOPortControl_Issue(
+    io_port_control: usize,
+    first_port: u16,
+    last_port: u16,
+    dest_cnode: usize,
+    dest_index: usize,
+    dest_depth: u8,
+) -> usize {
+    cap_invoke_with_extra(
+        io_port_control,
+        47, // X86IOPortControlIssue
+        &[first_port as usize, last_port as usize, dest_index, dest_depth as usize],
+        &[dest_cnode],
+    )
+}
+
+/// Write 8 bits to an I/O port.
+pub fn seL4_X86_IOPort_Out8(io_port_cap: usize, port: u16, data: u8) -> usize {
+    cap_invoke(io_port_cap, 51, &[port as usize, data as usize]) // X86IOPortOut8
+}
+
+/// Write 16 bits to an I/O port.
+pub fn seL4_X86_IOPort_Out16(io_port_cap: usize, port: u16, data: u16) -> usize {
+    cap_invoke(io_port_cap, 52, &[port as usize, data as usize]) // X86IOPortOut16
+}
+
+/// Write 32 bits to an I/O port.
+pub fn seL4_X86_IOPort_Out32(io_port_cap: usize, port: u16, data: u32) -> usize {
+    cap_invoke(io_port_cap, 53, &[port as usize, data as usize]) // X86IOPortOut32
 }
