@@ -24,17 +24,18 @@ CARGO_FLAGS := --target $(TARGET) --release \
 	-Z build-std-features=compiler-builtins-mem
 
 .DEFAULT_GOAL := help
-.PHONY: build image run run-kvm iso iso-run iso-run-kvm uefi uefi-run uefi-run-kvm clean help kernel patch http-boot http-boot-all http-boot-iso http-boot-grub http-boot-ipxe all
+.PHONY: build image run run-kvm iso iso-run iso-run-kvm uefi uefi-run uefi-run-kvm clean help kernel patch http-boot http-boot-all http-boot-iso http-boot-grub http-boot-ipxe all alpine-ext4
 
 ## Build everything (kernel + root-task + image) in one command
 all: kernel build image
 	@echo "==> All done. Run 'make run' to boot in QEMU."
 
-## Build root-task, blk-task, and lwext4-task
+## Build root-task, blk-task, lwext4-task, and ext4-srv
 build:
 	PATH=/tmp/x86_64-linux-musl-cross/bin:$$PATH cargo build $(CARGO_FLAGS) -p blk-task
 	PATH=/tmp/x86_64-linux-musl-cross/bin:$$PATH cargo build $(CARGO_FLAGS) -p lwext4-task
 	cargo build $(CARGO_FLAGS) -p root-task
+	cargo build $(CARGO_FLAGS) -p ext4-srv
 
 ## Apply seL4 UEFI boot patches
 patch:
@@ -230,6 +231,15 @@ http-boot-all: http-boot-iso http-boot-grub http-boot-ipxe
 http-boot:
 	cd $(HTTP_BOOT_DIR) && python3 -m http.server 8000
 
+## Create Alpine ext4 image for LCL
+ALPINE_IMG := $(HTTP_BOOT_DIR)/alpine.ext4
+ALPINE_IMG_SIZE ?= 32
+
+alpine-ext4:
+	@echo "==> Creating Alpine ext4 image..."
+	@./tools/create_alpine_ext4.sh $(ALPINE_IMG) $(ALPINE_IMG_SIZE)
+	@echo "==> Alpine ext4 image ready: $(ALPINE_IMG)"
+
 ## Help
 help:
 	@echo "rel4-linux-kit — seL4 x86_64 Root Task"
@@ -252,6 +262,7 @@ help:
 	@echo "  make http-boot-iso   Build UEFI ISO for HTTP boot"
 	@echo "  make http-boot-grub  Build GRUB EFI for HTTP boot"
 	@echo "  make http-boot-ipxe  Build iPXE EFI for HTTP boot"
+	@echo "  make alpine-ext4    Create Alpine ext4 image for LCL"
 	@echo ""
 	@sed -n 's/^## //p' Makefile
 

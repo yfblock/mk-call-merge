@@ -1,0 +1,10 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sel4-sys = { path = "../sel4-sys" }
+sel4-ulib = { path = "../sel4-ulib" }
+spin = "0.9"
+log = "0.4"

@@ -20,3 +20,20 @@ http-boot/ipxe.efi
 http-boot/snponly.efi
 http-boot/vmlinuz
 http-boot/sel4.iso
+
+# http-boot binaries and generated images
+http-boot/busybox
+http-boot/*.bin
+http-boot/alpine.ext4
+
+# Downloaded rootfs archives
+alpine-minirootfs-*.tar.gz
+
+# Build logs and conversation dumps
+2*-*-*-*.txt
+conversation-*.txt
+
+# Temporary notes (not for version control)
+ALPINE_ROOTFS_PROGRESS.md
+ALPINE_ROOTFS_STATUS.md
+GOAL_STATUS.md

@@ -49,7 +49,9 @@ worker_ep_entry:
     mov rdi, r12              // restore endpoint cap (clobbered by recv badge)
     mov rsi, 0                // msginfo = 0 (no message)
     mov rdx, -2               // SYS_REPLY_RECV
+    mov r14, rsp              // save user stack pointer (seL4 x86_64 ABI)
     syscall
+    mov rsp, r14              // restore user stack pointer
     jmp worker_ep_entry
 
 // Notification worker: Wait (Recv) loop
@@ -58,5 +60,7 @@ worker_ntfn_entry:
     mov rdi, r12              // restore notification cap
     mov rsi, 0                // msginfo = 0
     mov rdx, -5               // SYS_RECV
+    mov r14, rsp              // save user stack pointer (seL4 x86_64 ABI)
     syscall
+    mov rsp, r14              // restore user stack pointer
     jmp worker_ntfn_entry

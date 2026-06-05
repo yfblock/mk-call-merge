@@ -1,12 +1,13 @@
 [package]
-name = "root-task"
+name = "ext4-srv"
 version = "0.1.0"
 edition = "2024"
-description = "seL4 root task — initializes the system and runs built-in tests"
+description = "ext4 filesystem service for seL4 - provides file operations via IPC"
 
 [dependencies]
 sel4-sys = { path = "../crates/sel4-sys" }
 common = { path = "../crates/common" }
 blk-task = { path = "../blk-task" }
 lwext4-task = { path = "../lwext4-task" }
-lcl = { path = "../lcl" }
+spin = "0.9"
+log = "0.4"

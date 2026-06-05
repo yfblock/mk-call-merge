@@ -1,0 +1,33 @@
+//! 错误码定义
+
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const ESRCH: i32 = 3;
+pub const EINTR: i32 = 4;
+pub const EIO: i32 = 5;
+pub const ENXIO: i32 = 6;
+pub const EBADF: i32 = 9;
+pub const ENOMEM: i32 = 12;
+pub const EACCES: i32 = 13;
+pub const EFAULT: i32 = 14;
+pub const EEXIST: i32 = 17;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
+pub const EINVAL: i32 = 22;
+pub const EMFILE: i32 = 24;
+pub const ENOSPC: i32 = 28;
+pub const EPIPE: i32 = 32;
+pub const ERANGE: i32 = 34;
+pub const ENOSYS: i32 = 38;
+pub const ENOTEMPTY: i32 = 39;
+pub const EAGAIN: i32 = 11;
+pub const EWOULDBLOCK: i32 = 11;
+pub const EINPROGRESS: i32 = 115;
+pub const EALREADY: i32 = 114;
+pub const ENOTSOCK: i32 = 88;
+pub const EADDRINUSE: i32 = 98;
+pub const ECONNREFUSED: i32 = 111;
+pub const ETIMEDOUT: i32 = 110;
+pub const ECONNRESET: i32 = 104;
+pub const EPIPE2: i32 = 32;
+pub const ECHILD: i32 = 10;

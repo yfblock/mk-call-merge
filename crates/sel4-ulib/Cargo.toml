@@ -1,0 +1,10 @@
+[package]
+name = "sel4-ulib"
+version = "0.1.0"
+edition = "2024"
+description = "sel4-ulib compatibility layer over sel4-sys"
+
+[dependencies]
+sel4-sys = { path = "../sel4-sys" }
+spin = "0.9"
+log = "0.4"

@@ -16,6 +16,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "sel4-sys",
+ "sel4-ulib",
+ "spin",
+]
+
+[[package]]
+name = "ext4-srv"
+version = "0.1.0"
+dependencies = [
+ "blk-task",
+ "common",
+ "log",
+ "lwext4-task",
+ "sel4-sys",
+ "spin",
+]
+
+[[package]]
 name = "flatten_objects"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23,6 +45,25 @@ checksum = "2f7719d63de27ac93e7cd2c8e0c03083f8b0ff7f842fdb6280b8cdcac21b4baf"
 dependencies = [
  "bitmaps",
 ]
+
+[[package]]
+name = "lcl"
+version = "0.1.0"
+dependencies = [
+ "blk-task",
+ "common",
+ "flatten_objects",
+ "log",
+ "lwext4-task",
+ "sel4-sys",
+ "sel4-ulib",
+ "spin",
+ "srv-gate",
+]
+
+[[package]]
+name = "libc-core"
+version = "0.1.0"
 
 [[package]]
 name = "lock_api"
@@ -64,6 +105,8 @@ name = "root-task"
 version = "0.1.0"
 dependencies = [
  "blk-task",
+ "common",
+ "lcl",
  "lwext4-task",
  "sel4-sys",
 ]
@@ -79,10 +122,30 @@ name = "sel4-sys"
 version = "0.1.0"
 
 [[package]]
+name = "sel4-ulib"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "sel4-sys",
+ "spin",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "srv-gate"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "log",
+ "sel4-sys",
+ "sel4-ulib",
+ "spin",
 ]

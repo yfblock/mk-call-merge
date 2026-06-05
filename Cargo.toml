@@ -2,9 +2,15 @@
 resolver = "2"
 members = [
   "crates/sel4-sys",
+  "crates/sel4-ulib",
+  "crates/common",
+  "crates/srv-gate",
+  "crates/libc-core",
   "root-task",
   "blk-task",
   "lwext4-task",
+  "lcl",
+  "ext4-srv",
 ]
 
 [workspace.package]

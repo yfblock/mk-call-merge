@@ -1,7 +1,7 @@
 //! High-level seL4 system call wrappers.
 
 use crate::{
-    sys_null, ipc_buffer_addr, SYS_CALL, SYS_DEBUG_DUMP_SCHEDULER, SYS_DEBUG_HALT,
+    sys_null, ipc_buffer_addr, with_ipc_buffer, SYS_CALL, SYS_DEBUG_DUMP_SCHEDULER, SYS_DEBUG_HALT,
     SYS_DEBUG_PUT_CHAR, SYS_NBSEND, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
     SYS_SEND, SYS_SET_TLS_BASE, SYS_SIGNAL, SYS_YIELD,
 };
@@ -51,12 +51,46 @@ pub fn seL4_Reply(info: usize) {
 
 /// Blocking receive from an endpoint.
 ///
-/// Returns `(tag, badge)`.
+/// Returns `(tag, badge)` and writes MR[0..3] from CPU registers into the IPC buffer
+/// so that `with_ipc_buffer(|ib| ib.read_mr(i))` returns the correct values.
 pub fn seL4_Recv(src: usize) -> (usize, usize) {
+    let mut tag: usize;
+    let mut badge: usize;
+    let mut mr0: usize;
+    let mut mr1: usize;
+    let mut mr2: usize;
+    let mut mr3: usize;
     unsafe {
-        let (tag, badge, _) = crate::sys_send2(SYS_RECV, src, 0);
-        (tag, badge)
+        core::arch::asm!(
+            "mov r14, rsp",
+            "syscall",
+            "mov rsp, r14",
+            in("rdx") SYS_RECV,
+            in("rdi") src,
+            in("rsi") 0usize,
+            lateout("rax") _,
+            lateout("rdi") badge,
+            lateout("rsi") tag,
+            lateout("r10") mr0,
+            lateout("r8")  mr1,
+            lateout("r9")  mr2,
+            lateout("r15") mr3,
+            lateout("r12") _,
+            lateout("r13") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            lateout("r14") _,
+            options(nostack),
+        );
     }
+    // Write MR[0..3] to the IPC buffer so read_mr() works
+    with_ipc_buffer(|ib| {
+        ib.write_mr(0, mr0);
+        ib.write_mr(1, mr1);
+        ib.write_mr(2, mr2);
+        ib.write_mr(3, mr3);
+    });
+    (tag, badge)
 }
 
 /// Non-blocking receive from an endpoint.
@@ -84,6 +118,12 @@ pub fn seL4_ReplyRecv(dest: usize, info: usize, src: usize) -> (usize, usize) {
             lateout("rax") _badge_rax,
             lateout("rdi") tag,
             lateout("rsi") badge,
+            lateout("r10") _,
+            lateout("r8")  _,
+            lateout("r9")  _,
+            lateout("r12") _,
+            lateout("r13") _,
+            lateout("r15") _,
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
@@ -130,6 +170,14 @@ pub fn seL4_DebugPutChar(c: u8) {
             "mov rsp, r14",
             in("rdx") SYS_DEBUG_PUT_CHAR,
             in("rdi") c as usize,
+            lateout("rax") _,
+            lateout("rsi") _,
+            lateout("r10") _,
+            lateout("r8")  _,
+            lateout("r9")  _,
+            lateout("r12") _,
+            lateout("r13") _,
+            lateout("r15") _,
             lateout("rcx") _,
             lateout("r11") _,
             lateout("r14") _,
@@ -188,6 +236,7 @@ pub fn seL4_SetTLSBase(addr: usize) -> (usize, usize) {
 /// - Error: reply tag label = seL4 error code (non-zero)
 fn cap_invoke(dest: usize, label: u32, mrs: &[usize]) -> usize {
     let total_mrs = mrs.len();
+    // seL4 tag format: label at bits 12+, extraCaps at bits 7-8, length at bits 0-6
     let info = (label as usize) << 12 | total_mrs;
 
     // CPU registers carry MR0-MR3: r10=MR0, r8=MR1, r9=MR2, r15=MR3.
@@ -293,6 +342,58 @@ pub fn seL4_TCB_Configure(
 /// Write all registers for a TCB (set initial thread context).
 ///
 /// The `reg_frame` slice contains register values in the kernel's
+/// Read registers from a TCB.
+///
+/// `frameRegisters[]` order: FaultIP, RSP, FLAGS, RAX, RBX, RCX, RDX,
+/// RSI, RDI, RBP, R8, R9, R10, R11, R12, R13, R14, R15.
+///
+/// MR layout: MR0 = suspend (with archFlags in upper bits), MR1 = count,
+/// MR2.. = register values (output).
+///
+/// On x86_64, the first 4 message registers (MR0-MR3) are returned via CPU
+/// registers (r10, r8, r9, r15). The remaining registers are in the IPC buffer.
+pub fn seL4_TCB_ReadRegisters(
+    tcb: usize,
+    suspend: bool,
+    arch_flags: u8,
+    count: u8,
+    reg_frame: &mut [usize],
+) -> usize {
+    let flags = (suspend as usize) | ((arch_flags as usize) << 8);
+    let n = reg_frame.len().min(count as usize);
+    let mrs = [flags, n as usize];
+
+    // Use seL4_syscall_with_buf directly to capture CPU register outputs
+    let info = (2usize << 12) | mrs.len(); // label=2 (TCBReadRegisters), length=2
+    let buf_addr = ipc_buffer_addr() + 8; // msg[] starts at byte offset 8
+
+    let (_zero, tag, _badge, mr0, mr1, mr2, mr3, _, _) = unsafe {
+        crate::seL4_syscall_with_buf(
+            crate::SYS_CALL, tcb, info,
+            mrs[0], mrs[1], 0, 0, 0, 0, // MR0=flags, MR1=count, rest=0
+            buf_addr, 0, 0, 0, 0, 0, 0,
+        )
+    };
+
+    let error = tag >> 12;
+
+    // The first 4 registers come from CPU registers (mr0=MR0, mr1=MR1, etc.)
+    // The remaining registers come from the IPC buffer
+    if n > 0 { reg_frame[0] = mr0; }
+    if n > 1 { reg_frame[1] = mr1; }
+    if n > 2 { reg_frame[2] = mr2; }
+    if n > 3 { reg_frame[3] = mr3; }
+
+    // Read remaining registers from IPC buffer
+    crate::with_ipc_buffer(|ib| {
+        for i in 4..n {
+            reg_frame[i] = ib.read_mr(i);
+        }
+    });
+
+    error
+}
+
 /// `frameRegisters[]` order: FaultIP, RSP, FLAGS, RAX, RBX, RCX, RDX,
 /// RSI, RDI, RBP, R8, R9, R10, R11, R12, R13, R14, R15.
 ///
@@ -310,7 +411,7 @@ pub fn seL4_TCB_WriteRegisters(
     // Then getSyscallArg(2+i) = frameRegisters[i].
     let flags = (resume as usize) | ((arch_flags as usize) << 8);
     let n = reg_frame.len().min(count as usize);
-    let mut mrs = [0usize; 2 + 18]; // MR0=flags, MR1=count, MR2..=regs
+    let mut mrs = [0usize; 2 + 20]; // MR0=flags, MR1=count, MR2..=regs (up to 20)
     mrs[0] = flags;
     mrs[1] = n;
     mrs[2..2 + n].copy_from_slice(&reg_frame[..n]);
@@ -318,6 +419,16 @@ pub fn seL4_TCB_WriteRegisters(
 }
 
 /// Set scheduling parameters for a TCB.
+/// Suspend a TCB.
+pub fn seL4_TCB_Suspend(tcb: usize) -> usize {
+    cap_invoke(tcb, 11, &[]) // TCBSuspend label = 11
+}
+
+/// Resume a suspended TCB.
+pub fn seL4_TCB_Resume(tcb: usize) -> usize {
+    cap_invoke(tcb, 12, &[]) // TCBResume label = 12
+}
+
 pub fn seL4_TCB_SetSchedParams(
     tcb: usize,
     authority: usize,
@@ -488,12 +599,12 @@ pub fn seL4_PageDirectory_Map(
     vaddr: usize,
     attr: usize,
 ) -> usize {
-    cap_invoke_with_extra(pd, 33, &[vaddr, attr], &[vspace]) // X86PageDirectoryMap label
+    cap_invoke_with_extra(pd, 35, &[vaddr, attr], &[vspace]) // X86PageDirectoryMap label
 }
 
 /// Unmap a page directory.
 pub fn seL4_PageDirectory_Unmap(pd: usize) -> usize {
-    cap_invoke(pd, 34, &[]) // X86PageDirectoryUnmap label
+    cap_invoke(pd, 36, &[]) // X86PageDirectoryUnmap label
 }
 
 // ---------------------------------------------------------------------------
@@ -502,12 +613,12 @@ pub fn seL4_PageDirectory_Unmap(pd: usize) -> usize {
 
 /// Map a PDPT into a PML4.
 pub fn seL4_PDPT_Map(pdpt: usize, vspace: usize, vaddr: usize, attr: usize) -> usize {
-    cap_invoke_with_extra(pdpt, 33, &[vaddr, attr], &[vspace]) // X86PDPTMap label (same enum value as PageDirectoryMap)
+    cap_invoke_with_extra(pdpt, 33, &[vaddr, attr], &[vspace]) // X86PDPTMap label
 }
 
 /// Unmap a PDPT.
 pub fn seL4_PDPT_Unmap(pdpt: usize) -> usize {
-    cap_invoke(pdpt, 34, &[]) // X86PDPTUnmap label (same enum value as PageDirectoryUnmap)
+    cap_invoke(pdpt, 34, &[]) // X86PDPTUnmap label
 }
 
 // ---------------------------------------------------------------------------

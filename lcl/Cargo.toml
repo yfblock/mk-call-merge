@@ -1,0 +1,16 @@
+[package]
+name = "lcl"
+version = "0.1.0"
+edition = "2024"
+description = "Linux Compatible Layer - seL4-based Linux syscall emulation"
+
+[dependencies]
+sel4-sys = { path = "../crates/sel4-sys" }
+sel4-ulib = { path = "../crates/sel4-ulib" }
+common = { path = "../crates/common" }
+srv-gate = { path = "../crates/srv-gate" }
+blk-task = { path = "../blk-task" }
+lwext4-task = { path = "../lwext4-task" }
+spin = "0.9"
+log = "0.4"
+flatten_objects = "0.2.3"

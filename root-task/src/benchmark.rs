@@ -44,11 +44,11 @@ pub fn run(bi: &BootInfo) {
         ipc_frame_slot = sm.alloc().unwrap();
     }
 
-    let (untyped_slot, _untyped_size) = bi.find_free_untyped(12)
-        .expect("No untyped >= 4KB found for TCB/frame allocation");
     seL4_DebugPutString("[mt-bench] setting up kernel objects ...\n");
 
-    // --- Create all kernel objects ---
+    // Create each object from its own untyped to avoid child untyped conflicts.
+    // Using a single shared untyped causes child untyped objects to overwrite
+    // previously created capabilities (IPC buffer frame gets clobbered).
     for (name, obj_type, size_bits, slot) in [
         ("TCB", ObjectType::TCB as usize, ObjectType::TCB.size_bits(), tcb_slot),
         ("stack frame", ObjectType::Frame4K as usize, ObjectType::Frame4K.size_bits(), stack_frame_slot),
@@ -56,7 +56,17 @@ pub fn run(bi: &BootInfo) {
         ("Endpoint", ObjectType::Endpoint as usize, ObjectType::Endpoint.size_bits(), ep_slot),
         ("Notification", ObjectType::Notification as usize, ObjectType::Notification.size_bits(), ntfn_slot),
     ] {
-        let err = seL4_Untyped_Retype(untyped_slot, obj_type, size_bits,
+        // Find a fresh untyped for each object
+        let ut = match bi.find_free_untyped(size_bits as u8) {
+            Some((slot, _)) => slot,
+            None => {
+                seL4_DebugPutString("  FAILED no untyped for ");
+                seL4_DebugPutString(name);
+                seL4_DebugPutChar(b'\n');
+                return;
+            }
+        };
+        let err = seL4_Untyped_Retype(ut, obj_type, size_bits,
             init_slots::CNODE, init_slots::CNODE, CNODE_DEPTH, slot, 1);
         if err != 0 {
             seL4_DebugPutString("  FAILED creating ");
@@ -71,7 +81,11 @@ pub fn run(bi: &BootInfo) {
 
     // --- Create and map a PageTable for vaddr 0xF00000 ---
     let pt_slot = { SLOT_MANAGER.lock().alloc().unwrap() };
-    let err = seL4_Untyped_Retype(untyped_slot, ObjectType::PageTable as usize,
+    let pt_ut = match bi.find_free_untyped(ObjectType::PageTable.size_bits() as u8) {
+        Some((slot, _)) => slot,
+        None => { seL4_DebugPutString("  FAILED no untyped for PageTable\n"); return; }
+    };
+    let err = seL4_Untyped_Retype(pt_ut, ObjectType::PageTable as usize,
         ObjectType::PageTable.size_bits(), init_slots::CNODE, init_slots::CNODE,
         CNODE_DEPTH, pt_slot, 1);
     if err != 0 { seL4_DebugPutString("  FAILED creating PageTable\n"); return; }
