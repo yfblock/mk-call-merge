@@ -85,7 +85,7 @@ impl FSIface for EXT4FSImpl {
             ext4_file = Ext4File::new(path, InodeTypes::EXT4_DE_REG_FILE);
             ext4_file.file_open(path, flags).map_err(|e| e as i32)?;
         } else {
-            return Err(-13); // EACCES
+            return Err(-2); // ENOENT — file/dir does not exist
         }
 
         let file_size = ext4_file.file_size();

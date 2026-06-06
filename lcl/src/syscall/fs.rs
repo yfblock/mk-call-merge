@@ -140,8 +140,14 @@ pub fn sys_close(_task: &Arc<Sel4Task>, fd: usize) -> SysResult {
 }
 
 /// Seek in file
-pub fn sys_lseek(_task: &Arc<Sel4Task>, _fd: usize, _offset: isize, _whence: i32) -> SysResult {
-    Ok(0)
+pub fn sys_lseek(_task: &Arc<Sel4Task>, fd: usize, offset: isize, whence: i32) -> SysResult {
+    match fd {
+        0..=2 | 10..=12 => Err(29), // ESPIPE
+        _ => match FS_CLIENT.lseek(fd, offset, whence) {
+            Ok(pos) => Ok(pos),
+            Err(e) => Err(-e),
+        },
+    }
 }
 
 /// Get file status
@@ -162,14 +168,42 @@ pub fn sys_fstat(_task: &Arc<Sel4Task>, fd: usize, _stat_addr: usize) -> SysResu
     }
 }
 
-/// Get file status relative to directory
-pub fn sys_fstatat(task: &Arc<Sel4Task>, _dirfd: i32, path_addr: usize, _stat_addr: usize, _flags: u32) -> SysResult {
-    // Read path from task memory
+/// Get file status relative to directory.
+///
+/// On success, writes a Linux x86_64 `struct stat` (144 bytes) to `stat_addr`
+/// in the child's address space.  Only the fields that `ls` actually reads are
+/// filled; the rest are zeroed.
+pub fn sys_fstatat(task: &Arc<Sel4Task>, _dirfd: i32, path_addr: usize, stat_addr: usize, _flags: u32) -> SysResult {
     let path = read_cstr_from_task(task, path_addr);
 
-    // Try to stat via filesystem service
     match FS_CLIENT.stat(&path) {
-        Ok(_) => Ok(0),
+        Ok((mode, size, ino, nlink)) => {
+            // Build a minimal Linux x86_64 struct stat (144 bytes).
+            // Layout: st_dev(8) st_ino(8) st_nlink(8) st_mode(4) st_uid(4)
+            //         st_gid(4) __pad0(4) st_rdev(8) st_size(8) st_blksize(8)
+            //         st_blocks(8) st_atim(16) st_mtim(16) st_ctim(16)
+            let mut buf = [0u8; 144];
+            // st_ino @ offset 8
+            buf[8..16].copy_from_slice(&(ino as u64).to_le_bytes());
+            // st_nlink @ offset 16
+            buf[16..24].copy_from_slice(&(nlink as u64).to_le_bytes());
+            // st_mode @ offset 24
+            buf[24..28].copy_from_slice(&(mode as u32).to_le_bytes());
+            // st_uid = 0, st_gid = 0  (already zero)
+            // st_size @ offset 48
+            buf[48..56].copy_from_slice(&(size as u64).to_le_bytes());
+            // st_blksize @ offset 56
+            buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+            // st_blocks @ offset 64
+            let blocks = (size + 511) / 512;
+            buf[64..72].copy_from_slice(&(blocks as u64).to_le_bytes());
+
+            if task.write_bytes(stat_addr, &buf) {
+                Ok(0)
+            } else {
+                Err(14) // EFAULT
+            }
+        }
         Err(e) => Err(-e),
     }
 }

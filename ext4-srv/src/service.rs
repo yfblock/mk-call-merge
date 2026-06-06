@@ -48,71 +48,47 @@ impl FsService {
         }
     }
 
-    /// Handle a filesystem request
+    /// Handle a filesystem request (legacy path — used for fd-only ops)
     pub fn handle_request(&self, request: &FsRequest) -> FsResponse {
         match request {
-            FsRequest::Open { path_addr, path_len, flags } => {
-                self.handle_open(*path_addr, *path_len, *flags)
-            }
-            FsRequest::Read { fd, buf_addr, count } => {
-                self.handle_read(*fd, *buf_addr, *count)
-            }
-            FsRequest::Write { fd, data_addr, count } => {
-                self.handle_write(*fd, *data_addr, *count)
+            FsRequest::Read { fd, count, .. } => {
+                self.handle_read(*fd, *count)
             }
             FsRequest::Close { fd } => {
                 self.handle_close(*fd)
             }
-            FsRequest::Stat { path_addr, path_len, stat_addr } => {
-                self.handle_stat(*path_addr, *path_len, *stat_addr)
-            }
-            FsRequest::Getdents64 { fd, buf_addr, count } => {
-                self.handle_getdents64(*fd, *buf_addr, *count)
-            }
-            FsRequest::Mkdir { path_addr, path_len } => {
-                self.handle_mkdir(*path_addr, *path_len)
-            }
-            FsRequest::Unlink { path_addr, path_len } => {
-                self.handle_unlink(*path_addr, *path_len)
-            }
-            FsRequest::Access { path_addr, path_len, mode } => {
-                self.handle_access(*path_addr, *path_len, *mode)
+            FsRequest::Getdents64 { fd, count, .. } => {
+                self.handle_getdents64(*fd, *count)
             }
             FsRequest::FileSize { fd } => {
                 self.handle_file_size(*fd)
             }
+            _ => FsResponse::Err(-38), // ENOSYS for unhandled variants
         }
     }
 
-    /// Read a path from client memory (placeholder - in real impl would read from IPC buffer)
-    fn read_path(&self, path_addr: usize, path_len: usize) -> String {
-        // In real implementation, would read from client's memory via IPC
-        // For now, return empty string
-        String::new()
-    }
+    // ── path-bearing handlers (path already decoded from MRs) ──────
 
-    /// Handle open request
-    fn handle_open(&self, path_addr: usize, path_len: usize, flags: u32) -> FsResponse {
-        let path = self.read_path(path_addr, path_len);
+    /// Open a file/directory using a pre-decoded path
+    pub fn handle_open_with_path(&self, path: &str, flags: u32) -> FsResponse {
         if path.is_empty() {
             return FsResponse::Err(-22); // EINVAL
         }
 
         let mut fs = self.fs.lock();
-        match fs.open(&path, flags) {
+        match fs.open(path, flags) {
             Ok((inode, size)) => {
                 let mut fd_table = self.fd_table.lock();
                 let mut next_fd = self.next_fd.lock();
                 let fd = *next_fd;
                 *next_fd += 1;
 
-                // Ensure fd_table is large enough
                 while fd_table.len() <= fd {
                     fd_table.push(None);
                 }
 
                 fd_table[fd] = Some(FileEntry {
-                    path,
+                    path: String::from(path),
                     inode,
                     size,
                     offset: 0,
@@ -125,66 +101,146 @@ impl FsService {
         }
     }
 
-    /// Handle read request
-    fn handle_read(&self, fd: usize, buf_addr: usize, count: usize) -> FsResponse {
-        // Handle stdin
-        if fd == 0 {
-            return FsResponse::Ok(0); // EOF for stdin
+    /// Stat using a pre-decoded path — returns (mode, size_lo, size_hi, ino, nlink)
+    pub fn handle_stat_with_path(&self, path: &str) -> FsResponse {
+        if path.is_empty() {
+            return FsResponse::Err(-22);
         }
 
-        // Handle stdout/stderr
+        let mut fs = self.fs.lock();
+        match fs.open(path, 0) {
+            Ok((inode, _)) => {
+                let stat = fs.stat(inode);
+                fs.close(inode);
+
+                // Return 5 values packed into Ok/Ok2 + extra MRs.
+                // Use Ok2 for the first two, and the caller reads MR3..MR5
+                // from the IPC buffer.  But since our IPC helper only handles
+                // Ok / Ok2 / Err, we pack into the generic "Ok" variant with
+                // mode in the result and rely on the caller reading more MRs.
+                //
+                // Simpler: use Ok2(mode, size_lo) and let the main loop also
+                // write size_hi/ino/nlink into MR3..5 before replying.
+                // → We need a new variant or a custom approach.
+                //
+                // Simplest: just write all 5 fields into a small Vec and use
+                // OkWithData.  The client can unpack.
+                let mut data = Vec::with_capacity(20);
+                data.extend_from_slice(&(stat.mode as u32).to_le_bytes());
+                data.extend_from_slice(&(stat.size as u32).to_le_bytes());
+                data.extend_from_slice(((stat.size >> 32) as u32).to_le_bytes().as_ref());
+                data.extend_from_slice(&(stat.ino as u32).to_le_bytes());
+                data.extend_from_slice(&(stat.nlink as u32).to_le_bytes());
+                FsResponse::OkWithData(data)
+            }
+            Err(e) => FsResponse::Err(e),
+        }
+    }
+
+    /// Mkdir using a pre-decoded path
+    pub fn handle_mkdir_with_path(&self, path: &str) -> FsResponse {
+        if path.is_empty() {
+            return FsResponse::Err(-22);
+        }
+        let fs = self.fs.lock();
+        fs.mkdir(path);
+        FsResponse::Ok(0)
+    }
+
+    /// Unlink using a pre-decoded path
+    pub fn handle_unlink_with_path(&self, path: &str) -> FsResponse {
+        if path.is_empty() {
+            return FsResponse::Err(-22);
+        }
+        let fs = self.fs.lock();
+        fs.unlink(path);
+        FsResponse::Ok(0)
+    }
+
+    /// Access check using a pre-decoded path
+    pub fn handle_access_with_path(&self, path: &str) -> FsResponse {
+        if path.is_empty() {
+            return FsResponse::Err(-22);
+        }
+        let mut fs = self.fs.lock();
+        match fs.open(path, 0) {
+            Ok((inode, _)) => {
+                fs.close(inode);
+                FsResponse::Ok(0)
+            }
+            Err(_) => FsResponse::Err(-2), // ENOENT
+        }
+    }
+
+    /// Write with data already decoded from IPC
+    pub fn handle_write_with_data(&self, fd: usize, data: &[u8]) -> FsResponse {
+        if fd == 0 { return FsResponse::Err(-9); }
         if fd == 1 || fd == 2 {
-            return FsResponse::Err(-9); // EBADF
+            for &b in data {
+                sel4_sys::seL4_DebugPutChar(b);
+            }
+            return FsResponse::Ok(data.len());
         }
 
         let fd_table = self.fd_table.lock();
         if let Some(Some(entry)) = fd_table.get(fd) {
             let mut fs = self.fs.lock();
-            let mut buf = vec![0u8; count];
-            let bytes_read = fs.read_at(entry.inode as u64, entry.offset, &mut buf);
+            let bytes_written = fs.write_at(entry.inode as u64, entry.offset, data);
+            FsResponse::Ok(bytes_written)
+        } else {
+            FsResponse::Err(-9)
+        }
+    }
 
-            // In real implementation, would write to client's memory via IPC
-            // For now, just return bytes_read
+    /// Lseek — update the offset of an open fd
+    pub fn handle_lseek(&self, fd: usize, offset: isize, whence: i32) -> FsResponse {
+        if fd <= 2 { return FsResponse::Err(-29); } // ESPIPE
 
-            FsResponse::Ok(bytes_read)
+        let mut fd_table = self.fd_table.lock();
+        if let Some(Some(entry)) = fd_table.get_mut(fd) {
+            // Linux SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+            let new_off = match whence {
+                0 => {
+                    if offset < 0 { return FsResponse::Err(-22); } // EINVAL
+                    offset as usize
+                }
+                1 => (entry.offset as isize + offset) as usize,
+                2 => {
+                    if offset > 0 { return FsResponse::Err(-22); }
+                    (entry.size as isize + offset) as usize
+                }
+                _ => return FsResponse::Err(-22),
+            };
+            entry.offset = new_off;
+            FsResponse::Ok(new_off)
         } else {
             FsResponse::Err(-9) // EBADF
         }
     }
 
-    /// Handle write request
-    fn handle_write(&self, fd: usize, data_addr: usize, count: usize) -> FsResponse {
-        // Handle stdin
-        if fd == 0 {
-            return FsResponse::Err(-9); // EBADF
-        }
+    // ── fd-based handlers (no path needed) ─────────────────────────
 
-        // Handle stdout/stderr - write to debug console
-        if fd == 1 || fd == 2 {
-            // In real implementation, would read from client's memory via IPC
-            // For now, just return count
-            return FsResponse::Ok(count);
-        }
+    /// Handle read request — returns data inline via OkWithData
+    fn handle_read(&self, fd: usize, count: usize) -> FsResponse {
+        if fd == 0 { return FsResponse::Ok(0); } // stdin EOF
+        if fd == 1 || fd == 2 { return FsResponse::Err(-9); }
 
-        let fd_table = self.fd_table.lock();
-        if let Some(Some(entry)) = fd_table.get(fd) {
+        let mut fd_table = self.fd_table.lock();
+        if let Some(Some(entry)) = fd_table.get_mut(fd) {
             let mut fs = self.fs.lock();
-            // In real implementation, would read data from client's memory
-            let data = vec![0u8; count]; // Placeholder
-            let bytes_written = fs.write_at(entry.inode as u64, entry.offset, &data);
-
-            FsResponse::Ok(bytes_written)
+            let mut buf = vec![0u8; count];
+            let bytes_read = fs.read_at(entry.inode as u64, entry.offset, &mut buf);
+            entry.offset += bytes_read;
+            buf.truncate(bytes_read);
+            FsResponse::OkWithData(buf)
         } else {
-            FsResponse::Err(-9) // EBADF
+            FsResponse::Err(-9)
         }
     }
 
     /// Handle close request
     fn handle_close(&self, fd: usize) -> FsResponse {
-        // Handle stdin/stdout/stderr
-        if fd <= 2 {
-            return FsResponse::Ok(0);
-        }
+        if fd <= 2 { return FsResponse::Ok(0); }
 
         let mut fd_table = self.fd_table.lock();
         if let Some(Some(entry)) = fd_table.get(fd) {
@@ -193,85 +249,25 @@ impl FsService {
             fd_table[fd] = None;
             FsResponse::Ok(0)
         } else {
-            FsResponse::Err(-9) // EBADF
+            FsResponse::Err(-9)
         }
     }
 
-    /// Handle stat request
-    fn handle_stat(&self, path_addr: usize, path_len: usize, stat_addr: usize) -> FsResponse {
-        let path = self.read_path(path_addr, path_len);
-        if path.is_empty() {
-            return FsResponse::Err(-22); // EINVAL
-        }
-
-        let mut fs = self.fs.lock();
-        match fs.open(&path, 0) {
-            Ok((inode, _)) => {
-                let stat = fs.stat(inode);
-                fs.close(inode);
-
-                // In real implementation, would write stat to client's memory
-                // For now, just return success
-                FsResponse::Ok(0)
-            }
-            Err(e) => FsResponse::Err(e),
-        }
-    }
-
-    /// Handle getdents64 request
-    fn handle_getdents64(&self, fd: usize, buf_addr: usize, count: usize) -> FsResponse {
-        let fd_table = self.fd_table.lock();
-        if let Some(Some(entry)) = fd_table.get(fd) {
+    /// Handle getdents64 — returns directory entries inline via OkWithData2
+    fn handle_getdents64(&self, fd: usize, count: usize) -> FsResponse {
+        let mut fd_table = self.fd_table.lock();
+        if let Some(Some(entry)) = fd_table.get_mut(fd) {
             let mut fs = self.fs.lock();
             let mut buf = vec![0u8; count];
             let (bytes_read, new_offset) = fs.getdents64(entry.inode as u64, entry.offset, &mut buf);
 
-            // In real implementation, would write to client's memory
-            // For now, return (bytes_read, new_offset)
-            FsResponse::Ok2(bytes_read, new_offset)
+            // Update the stored offset so the next call continues where we left off
+            entry.offset = new_offset;
+
+            buf.truncate(bytes_read);
+            FsResponse::OkWithData2(buf, new_offset)
         } else {
-            FsResponse::Err(-9) // EBADF
-        }
-    }
-
-    /// Handle mkdir request
-    fn handle_mkdir(&self, path_addr: usize, path_len: usize) -> FsResponse {
-        let path = self.read_path(path_addr, path_len);
-        if path.is_empty() {
-            return FsResponse::Err(-22); // EINVAL
-        }
-
-        let fs = self.fs.lock();
-        fs.mkdir(&path);
-        FsResponse::Ok(0)
-    }
-
-    /// Handle unlink request
-    fn handle_unlink(&self, path_addr: usize, path_len: usize) -> FsResponse {
-        let path = self.read_path(path_addr, path_len);
-        if path.is_empty() {
-            return FsResponse::Err(-22); // EINVAL
-        }
-
-        let fs = self.fs.lock();
-        fs.unlink(&path);
-        FsResponse::Ok(0)
-    }
-
-    /// Handle access request
-    fn handle_access(&self, path_addr: usize, path_len: usize, mode: u32) -> FsResponse {
-        let path = self.read_path(path_addr, path_len);
-        if path.is_empty() {
-            return FsResponse::Err(-22); // EINVAL
-        }
-
-        let mut fs = self.fs.lock();
-        match fs.open(&path, 0) {
-            Ok((inode, _)) => {
-                fs.close(inode);
-                FsResponse::Ok(0) // Accessible
-            }
-            Err(_) => FsResponse::Err(-2), // ENOENT
+            FsResponse::Err(-9)
         }
     }
 
@@ -281,7 +277,7 @@ impl FsService {
         if let Some(Some(entry)) = fd_table.get(fd) {
             FsResponse::Ok(entry.size)
         } else {
-            FsResponse::Err(-9) // EBADF
+            FsResponse::Err(-9)
         }
     }
 }

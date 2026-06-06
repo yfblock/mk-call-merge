@@ -34,15 +34,12 @@ pub enum FsResponse {
     Ok(usize),
     /// Success with two result values (for getdents64)
     Ok2(usize, usize),
+    /// Success with inline data payload (read / getdents64 entries)
+    OkWithData(alloc::vec::Vec<u8>),
+    /// Success with data payload + one extra value (getdents64: entries + new_offset)
+    OkWithData2(alloc::vec::Vec<u8>, usize),
     /// Error with errno
     Err(i32),
-}
-
-/// IPC message wrapper
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FsMessage {
-    pub request: FsRequest,
 }
 
 /// seL4 endpoint capability slot for the filesystem service
