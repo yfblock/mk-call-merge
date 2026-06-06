@@ -163,7 +163,11 @@ fn main(bi_frame_vptr: usize) {
     seL4_DebugPutString("Shutting down.\n\n");
 
     // Trigger QEMU isa-debug-exit via I/O port 0x501.
-    let io_slot = { SLOT_MANAGER.lock().alloc().unwrap() };
+    // Use OBJ_ALLOCATOR (advanced past everything busybox consumed) rather
+    // than SLOT_MANAGER, whose cursor is stale: busybox allocated its TCB and
+    // frames directly from OBJ_ALLOCATOR starting at empty.start, so a slot
+    // from SLOT_MANAGER would collide with busybox's still-live TCB cap.
+    let io_slot = { lcl::utils::obj::OBJ_ALLOCATOR.lock().alloc().unwrap() };
     let _ = seL4_X86_IOPortControl_Issue(7, 0x501, 0x502, 2, io_slot, 64);
     let _ = seL4_X86_IOPort_Out16(io_slot, 0x501, 0x0001);
 
