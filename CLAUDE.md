@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **rel4-linux-kit** runs the seL4 microkernel on x86_64 with a Linux-compatible syscall emulation layer (LCL). The goal is to run Linux ELF binaries (like busybox) on seL4 by intercepting syscalls and translating them into seL4 IPC operations.
 
+**Long-term goal**: run `busybox iozone` against an ext4 filesystem — i.e. the emulated Linux process performs real file I/O (open/read/write/lseek/stat on ext4 files) through the LCL, backed by the ext4-srv → lwext4-task → blk-task stack. This requires the LCL's file syscalls (open/openat, read, write, lseek, stat/fstat, close, getdents64, etc.) to be wired through to the ext4 IPC service instead of the current stubs.
+
 ## Build Commands
 
 ```bash
@@ -103,6 +105,18 @@ Test output goes to seL4 debug serial. On completion, the system triggers QEMU's
 - **Alpine ext4 image not found**: run `make alpine-ext4` first
 - **QEMU exits immediately**: check if `isa-debug-exit` is configured; test output is on serial console
 
-## Current Blocker
+## Current Status
 
-busybox execution hits a **capability fault** because seL4 writes fault message registers (FaultIP, FaultAddr) to the TCB's register file, but the fault handler reads from CPU registers via `seL4_Recv` (stale values). Fix requires reading fault MRs from the TCB register file or using a different IPC mechanism. See `GOAL_STATUS.md` for details.
+busybox runs on seL4: it executes to completion, runs shell scripts (`sh -c "..."`), and supports an interactive shell with a `/ # ` prompt (driven via COM1 serial input). The child runs in the root task's VSpace; syscalls are emulated by handling UnknownSyscall faults in `root-task/src/main.rs` (`test_busybox()`), with ELF loading and task setup in `lcl/src/task/runner.rs`.
+
+### Toward the long-term goal (busybox iozone on ext4)
+
+The remaining work is making the LCL's **file syscalls operate on a real ext4 filesystem** rather than returning stubs:
+
+- File syscalls are currently stubbed: `open`/`openat` → ENOENT, `read(fd>2)` → EOF, `write`/`writev` → console only, `stat`/`fstat`/`getdents64`/`lseek` → mostly unimplemented.
+- Wire these through the existing IPC path: LCL `fs/ipc_client.rs` → `ext4-srv/src/service.rs` → `lwext4-task` → `blk-task` ramdisk (holds the ext4 image).
+- Maintain a per-process fd table in the LCL mapping fds to ext4 inodes/handles.
+- `iozone` exercises sequential/random read/write, lseek, file create/delete, and fstat — each needs a working path to the ext4 service.
+
+Note: the bundled busybox (`http-boot/busybox`, gitignored) is a static glibc build. A static musl busybox was tried but crashes during libc init under the current loader; the glibc one is the working binary.
+
