@@ -458,6 +458,13 @@ pub fn seL4_TCB_SetTLSBase(tcb: usize, tls_base: usize) -> usize {
     cap_invoke(tcb, 15, &[tls_base]) // TCBSetTLSBase label
 }
 
+/// Set/clear TCB flags. `clear` is a bitmask of flags to clear, `set` a mask
+/// to set. seL4_TCBFlag_fpuDisabled = 0x1 — clearing it enables the FPU/SSE
+/// for the thread (TCBs are created with the FPU disabled by default).
+pub fn seL4_TCB_SetFlags(tcb: usize, clear: usize, set: usize) -> usize {
+    cap_invoke(tcb, 16, &[clear, set]) // TCBSetFlags label
+}
+
 // ---------------------------------------------------------------------------
 // CNode (Capability space) operations
 // ---------------------------------------------------------------------------
@@ -707,4 +714,19 @@ pub fn seL4_X86_IOPort_Out16(io_port_cap: usize, port: u16, data: u16) -> usize 
 /// Write 32 bits to an I/O port.
 pub fn seL4_X86_IOPort_Out32(io_port_cap: usize, port: u16, data: u32) -> usize {
     cap_invoke(io_port_cap, 53, &[port as usize, data as usize]) // X86IOPortOut32
+}
+
+/// Read 8 bits from an I/O port. Returns (error, value); the kernel returns
+/// the byte read in MR0 of the reply.
+pub fn seL4_X86_IOPort_In8(io_port_cap: usize, port: u16) -> (usize, u8) {
+    let info = (48usize) << 12 | 1; // X86IOPortIn8, length 1
+    let buf_addr = ipc_buffer_addr() + 8;
+    let (_zero, tag, _badge, mr0, _, _, _, _, _) = unsafe {
+        crate::seL4_syscall_with_buf(
+            crate::SYS_CALL, io_port_cap, info,
+            port as usize, 0, 0, 0, 0, 0,
+            buf_addr, 0, 0, 0, 0, 0, 0,
+        )
+    };
+    ((tag >> 12), (mr0 & 0xff) as u8)
 }

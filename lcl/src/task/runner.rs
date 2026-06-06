@@ -453,6 +453,33 @@ pub fn create_user_task(
     print_hex(stack_frame_slot);
     seL4_DebugPutChar(b'\n');
 
+    // Map additional stack pages BELOW STACK_VADDR so the child has room to
+    // grow its stack (shells recurse through for-loops, command substitution,
+    // etc.). The stack page table at 0xF00000 already covers this range. The
+    // root task shares this VSpace and reads child stack memory in syscall
+    // handlers, so these must be eagerly mapped — a lazy fault there would be
+    // taken by the root task itself and crash it.
+    const STACK_EXTRA_PAGES: usize = 32; // 128 KiB below the top page
+    for i in 1..=STACK_EXTRA_PAGES {
+        let vaddr = STACK_VADDR - i * PAGE_SIZE;
+        if let Some((ut, _)) = bi.find_free_untyped(12) {
+            let slot = { crate::utils::obj::OBJ_ALLOCATOR.lock().alloc()? };
+            let e = seL4_Untyped_Retype(
+                ut, ObjectType::Frame4K as usize,
+                ObjectType::Frame4K.size_bits(), init_slots::CNODE, init_slots::CNODE,
+                CNODE_DEPTH, slot, 1,
+            );
+            if e != 0 { seL4_DebugPutString("[runner] extra stack retype fail\n"); return None; }
+            let e = seL4_Frame_Map(slot, init_slots::VSPACE, vaddr, CapRights::ALL.bits(), 0);
+            if e != 0 { seL4_DebugPutString("[runner] extra stack map fail\n"); return None; }
+            unsafe {
+                let dest = vaddr as *mut u8;
+                for k in 0..PAGE_SIZE { dest.add(k).write_volatile(0); }
+            }
+        }
+    }
+    seL4_DebugPutString("[runner] Extra stack pages mapped\n");
+
     // Create and map IPC buffer frame - use a fresh untyped
     let (ipc_untyped, _) = bi.find_free_untyped(12)?; // 4KB
     let err = seL4_Untyped_Retype(
@@ -584,34 +611,9 @@ pub fn create_user_task(
     print_hex(tls_base);
     seL4_DebugPutChar(b'\n');
 
-    // Write a trampoline at the beginning of the stack page:
-    // wrfsbase eax       (f3 0f ae d0)  - set FS_BASE from EAX
-    // movabs $entry, %rax (48 b8 XX XX XX XX XX XX XX XX) - load entry address
-    // jmp *%rax           (ff e0)    - jump to entry
-    let trampoline_addr = STACK_VADDR;
-    unsafe {
-        let dest = trampoline_addr as *mut u8;
-        // wrfsbase eax (F3 0F AE D0)
-        dest.add(0).write_volatile(0xf3);
-        dest.add(1).write_volatile(0x0f);
-        dest.add(2).write_volatile(0xae);
-        dest.add(3).write_volatile(0xd0);
-        // movabs $relocated_entry, %rax
-        dest.add(4).write_volatile(0x48);
-        dest.add(5).write_volatile(0xb8);
-        let entry_bytes = relocated_entry.to_le_bytes();
-        for k in 0..8 {
-            dest.add(6 + k).write_volatile(entry_bytes[k]);
-        }
-        // jmp *%rax
-        dest.add(14).write_volatile(0xff);
-        dest.add(15).write_volatile(0xe0);
-    }
-    seL4_DebugPutString("[runner] Trampoline at 0x");
-    print_hex(trampoline_addr);
-    seL4_DebugPutString(" -> 0x");
-    print_hex(relocated_entry);
-    seL4_DebugPutChar(b'\n');
+    // (The old wrfsbase trampoline at the bottom of the stack page is gone —
+    // we now set the TLS base via seL4_TCB_SetTLSBase and start directly at
+    // the ELF entry, so nothing needs to be written into the stack page here.)
 
     // Write Linux x86_64 ABI stack frame for the child task.
     //
@@ -642,13 +644,23 @@ pub fn create_user_task(
         for (i, &b) in platform.iter().enumerate() { s.add(i).write_volatile(b); }
     }
 
-    // "busybox\0" string for argv[0]
-    let argv0 = b"busybox\0";
-    data -= argv0.len();
-    let str_addr = data;
-    unsafe {
-        let s = str_addr as *mut u8;
-        for (i, &b) in argv0.iter().enumerate() { s.add(i).write_volatile(b); }
+    // argv strings (default to ["busybox"] if none supplied). Each string is
+    // written into the data area (growing down); collect their addresses in
+    // the original argv order.
+    let default_args: [&str; 1] = ["busybox"];
+    let args: &[&str] = if _args.is_empty() { &default_args } else { _args };
+
+    let mut argv_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(args.len());
+    for &arg in args {
+        let bytes = arg.as_bytes();
+        data -= bytes.len() + 1; // +1 for NUL terminator
+        let addr = data;
+        unsafe {
+            let s = addr as *mut u8;
+            for (i, &b) in bytes.iter().enumerate() { s.add(i).write_volatile(b); }
+            s.add(bytes.len()).write_volatile(0);
+        }
+        argv_addrs.push(addr);
     }
 
     // Compute aux vector values
@@ -678,8 +690,8 @@ pub fn create_user_task(
         (0, 0),                  // AT_NULL terminator
     ];
 
-    // argv[] and envp[] pointers (each NULL-terminated).
-    let argv: [usize; 1] = [str_addr];
+    // argv[] = collected string addresses; envp[] empty.
+    let argv: &[usize] = &argv_addrs;
     let envp: [usize; 0] = [];
 
     // Total array size: argc(8) + argv ptrs + argv NULL + envp ptrs + envp NULL + auxv.
@@ -703,7 +715,7 @@ pub fn create_user_task(
         p += 8;
     };
     push(argv.len());                  // argc
-    for &a in &argv { push(a); }       // argv[]
+    for &a in argv { push(a); }        // argv[]
     push(0);                           // argv NULL
     for &e in &envp { push(e); }       // envp[]
     push(0);                           // envp NULL
@@ -714,23 +726,44 @@ pub fn create_user_task(
 
     seL4_DebugPutString("[runner] rsp=0x");
     print_hex(rsp);
-    seL4_DebugPutString(" argc@0x");
-    print_hex(base);
+    seL4_DebugPutString(" argc=");
+    print_hex(argv.len());
     seL4_DebugPutString(" argv0=0x");
-    print_hex(str_addr);
+    print_hex(argv_addrs[0]);
     seL4_DebugPutChar(b'\n');
 
     // Write initial registers (seL4 x86_64 UserContext layout)
     // Index 0=RIP, 1=RSP, 2=RFLAGS, 3=RAX, 4=RBX, 5=RCX, 6=RDX,
     // 7=RSI, 8=RDI, 9=RBP, 10=R8, 11=R9, 12=R10, 13=R11, 14=R12, 15=R13, 16=R14, 17=R15
-    // Start at the trampoline which does: wrfsbase eax; jmp entry
-    // RAX = TLS base so wrfsbase sets FS_BASE correctly
+    // Set the initial TLS base via the kernel API (cleaner than a wrfsbase
+    // trampoline). musl/glibc will later reset FS_BASE via arch_prctl during
+    // libc init; this just gives a valid bootstrap value.
+    let _ = seL4_TCB_SetTLSBase(tcb_slot, tls_base);
+
+    // Enable the FPU/SSE for the child. seL4 creates TCBs with the FPU
+    // disabled (seL4_TCBFlag_fpuDisabled = 0x1); musl's startup uses SSE
+    // (movdqa/movups) almost immediately, so clear that flag or the first
+    // SSE instruction faults.
+    let fe = seL4_TCB_SetFlags(tcb_slot, 0x1, 0);
+    if fe != 0 {
+        seL4_DebugPutString("[runner] SetFlags(enable FPU) err=");
+        print_hex(fe as usize);
+        seL4_DebugPutChar(b'\n');
+    }
+
+    // Write initial registers (seL4 x86_64 UserContext layout)
+    // Index 0=RIP, 1=RSP, 2=RFLAGS, 3=RAX, 4=RBX, 5=RCX, 6=RDX,
+    // 7=RSI, 8=RDI, 9=RBP, 10=R8, 11=R9, 12=R10, 13=R11, 14=R12, 15=R13, 16=R14, 17=R15
+    // Start directly at the ELF entry point. The SysV ABI entry contract only
+    // requires RSP → argc and RDX = 0 (no rtld fini); all other GPRs are
+    // cleared so the program's _start sees a pristine state.
     let regs: [usize; 18] = [
-        trampoline_addr,  // 0: RIP = trampoline (wrfsbase eax; jmp entry)
+        relocated_entry,  // 0: RIP = ELF entry point
         rsp,              // 1: RSP
         0x202,            // 2: RFLAGS
-        tls_base,         // 3: RAX = TLS base for wrfsbase
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0,          // 3-5: RAX, RBX, RCX
+        0,                // 6: RDX = 0 (no dynamic-linker finalizer)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
     // Use seL4_TCB_WriteRegisters to set registers and resume the task

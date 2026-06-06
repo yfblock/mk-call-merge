@@ -767,6 +767,58 @@ fn print_hex(val: usize) {
     }
 }
 
+/// Read one line from COM1 into the child buffer at `buf` (max `count` bytes).
+/// Blocks polling the UART line-status register until input arrives. Echoes
+/// characters, handles backspace, and terminates the line on CR or LF (which
+/// is stored as '\n'). Returns the number of bytes written into the buffer.
+fn read_stdin_line(com1_cap: usize, buf: usize, count: usize) -> usize {
+    const LSR: u16 = 0x3fd; // line status register
+    const DATA: u16 = 0x3f8; // receive buffer
+    let mut n = 0usize;
+    loop {
+        // Poll until the "data ready" bit (LSR bit 0) is set.
+        let (err, lsr) = seL4_X86_IOPort_In8(com1_cap, LSR);
+        if err != 0 { return n; }
+        if lsr & 0x01 == 0 {
+            // No byte available yet — yield and retry so we don't starve the
+            // (single-core) system while waiting on a human.
+            seL4_Yield();
+            continue;
+        }
+        let (err, ch) = seL4_X86_IOPort_In8(com1_cap, DATA);
+        if err != 0 { return n; }
+
+        match ch {
+            b'\r' | b'\n' => {
+                seL4_DebugPutChar(b'\r');
+                seL4_DebugPutChar(b'\n');
+                if n < count {
+                    unsafe { core::ptr::write_volatile((buf + n) as *mut u8, b'\n'); }
+                    n += 1;
+                }
+                return n;
+            }
+            0x7f | 0x08 => {
+                // backspace / delete
+                if n > 0 {
+                    n -= 1;
+                    seL4_DebugPutChar(0x08);
+                    seL4_DebugPutChar(b' ');
+                    seL4_DebugPutChar(0x08);
+                }
+            }
+            _ => {
+                if n < count {
+                    unsafe { core::ptr::write_volatile((buf + n) as *mut u8, ch); }
+                    n += 1;
+                    seL4_DebugPutChar(ch); // echo
+                }
+            }
+        }
+        if n >= count { return n; }
+    }
+}
+
 #[allow(dead_code)]
 fn test_busybox(bi_frame_vptr: usize) {
     use lcl::task::runner;
@@ -794,12 +846,30 @@ fn test_busybox(bi_frame_vptr: usize) {
     put_u64(busybox.len() as u64);
     seL4_DebugPutString(" bytes\n");
 
-    match runner::create_user_task(&bi, busybox, &["busybox", "echo", "hello"]) {
+    match runner::create_user_task(&bi, busybox, &["busybox", "sh"]) {
         Some((fault_ep, busybox_tcb)) => {
             seL4_DebugPutString("[busybox] Task created, listening for faults...\n");
 
             let mut fault_count = 0usize;
             let mut child_exited = false;
+
+            // brk heap and mmap regions for the child. Pages are mapped lazily
+            // by the VMFault handler, so we only track the virtual cursors.
+            let mut brk_cur: usize = 0x0700_0000;          // current program break
+            let mut mmap_cur: usize = 0x1000_0000;         // mmap bump pointer (grows up)
+
+            // Issue an I/O-port capability covering COM1 (0x3f8..0x3ff) so the
+            // read(stdin) handler can poll the UART for interactive input.
+            let com1_cap = { OBJ_ALLOCATOR.lock().alloc().unwrap() };
+            let ioc = seL4_X86_IOPortControl_Issue(
+                init_slots::IO_PORT_CONTROL, 0x3f8, 0x3ff,
+                init_slots::CNODE, com1_cap, 64,
+            );
+            if ioc != 0 {
+                seL4_DebugPutString("[busybox] COM1 ioport issue err=");
+                print_hex(ioc as usize);
+                seL4_DebugPutChar(b'\n');
+            }
 
             loop {
                 let (tag, _badge) = sel4_sys::seL4_Recv(fault_ep);
@@ -808,7 +878,7 @@ fn test_busybox(bi_frame_vptr: usize) {
         let fault_type = label & 0xf;
         fault_count += 1;
 
-        if fault_count > 2000 {
+        if fault_count > 100000 {
             seL4_DebugPutString("[busybox] Too many faults, stopping\n");
             break;
         }
@@ -853,10 +923,36 @@ fn test_busybox(bi_frame_vptr: usize) {
                             64, frame_slot, 1,
                         );
                         if err == 0 {
-                            let map_err = seL4_Frame_Map(
+                            let mut map_err = seL4_Frame_Map(
                                 frame_slot, sel4_sys::init_slots::VSPACE, fault_page,
                                 CapRights::ALL.bits(), 0,
                             );
+                            // err 8 (FailedLookup) → the page table for this
+                            // 2MB region doesn't exist yet. Create + map a PT,
+                            // then retry the frame map. Without this, faults in
+                            // a fresh mmap region would loop forever, draining
+                            // untyped memory one frame at a time.
+                            if map_err != 0 {
+                                if let Some((pt_ut, _)) = bi.find_free_untyped(12) {
+                                    let pt_slot = { OBJ_ALLOCATOR.lock().alloc().unwrap() };
+                                    let pe = seL4_Untyped_Retype(
+                                        pt_ut, ObjectType::PageTable as usize,
+                                        ObjectType::PageTable.size_bits(),
+                                        init_slots::CNODE, init_slots::CNODE,
+                                        64, pt_slot, 1,
+                                    );
+                                    if pe == 0 {
+                                        let _ = seL4_PageTable_Map(
+                                            pt_slot, init_slots::VSPACE,
+                                            fault_page & !0x1FFFFF, 0,
+                                        );
+                                        map_err = seL4_Frame_Map(
+                                            frame_slot, sel4_sys::init_slots::VSPACE,
+                                            fault_page, CapRights::ALL.bits(), 0,
+                                        );
+                                    }
+                                }
+                            }
                             if map_err == 0 {
                                 unsafe {
                                     let dest = fault_page as *mut u8;
@@ -864,6 +960,13 @@ fn test_busybox(bi_frame_vptr: usize) {
                                         dest.add(i).write_volatile(0);
                                     }
                                 }
+                            } else {
+                                seL4_DebugPutString("[busybox] map fail at 0x");
+                                print_hex(fault_page);
+                                seL4_DebugPutString(" err=");
+                                print_hex(map_err as usize);
+                                seL4_DebugPutChar(b'\n');
+                                kill_child = true;
                             }
                         }
                     }
@@ -914,7 +1017,19 @@ fn test_busybox(bi_frame_vptr: usize) {
                 let rdx = regs[6];
 
                 let ret_val: usize = match rax {
-                    0 => 0,
+                    // read(fd, buf, count): for stdin, emit a shell-style prompt
+                    // then poll COM1 for a line (echo + backspace handling).
+                    // busybox reads commands from fd 0 one line at a time, so a
+                    // prompt before each read reproduces an interactive shell.
+                    // Other fds → EOF.
+                    0 => {
+                        if rdi == 0 && rdx > 0 {
+                            seL4_DebugPutString("/ # ");
+                            read_stdin_line(com1_cap, rsi, rdx)
+                        } else {
+                            0
+                        }
+                    }
                     1 => {
                         if rdi <= 2 {
                             for j in 0..rdx.min(4096) {
@@ -925,12 +1040,67 @@ fn test_busybox(bi_frame_vptr: usize) {
                         } else { (-1i32) as usize }
                     }
                     3 => 0,
-                    9 => (-19i32) as usize,
+                    // writev(fd, iov, iovcnt): write each iovec to fd (stdout/
+                    // stderr → debug console). struct iovec { base; len } (16B).
+                    20 => {
+                        if rdi <= 2 {
+                            let mut total = 0usize;
+                            for v in 0..rdx.min(64) {
+                                let iov = rsi + v * 16;
+                                let base = unsafe { core::ptr::read_volatile(iov as *const usize) };
+                                let len = unsafe { core::ptr::read_volatile((iov + 8) as *const usize) };
+                                for j in 0..len.min(8192) {
+                                    let byte = unsafe { core::ptr::read_volatile((base + j) as *const u8) };
+                                    seL4_DebugPutChar(byte);
+                                }
+                                total += len;
+                            }
+                            total
+                        } else { (-9i32) as usize } // EBADF
+                    }
+                    // open/openat: no real filesystem for the child yet → ENOENT.
+                    2 | 257 => (-2i32) as usize,
+                    // fcntl: accept (return 0) for F_SETFD/F_GETFD etc.
+                    72 => 0,
+                    // mmap(addr=rdi, len=rsi, prot=rdx, ...): bump-allocate
+                    // anonymous pages. Frames are mapped lazily on first access
+                    // by the VMFault handler.
+                    9 => {
+                        let len = (rsi + 0xFFF) & !0xFFF;
+                        let addr = mmap_cur;
+                        mmap_cur += len.max(0x1000);
+                        addr
+                    }
                     10 => 0,
                     11 => 0,
-                    12 => rdi,
+                    // brk: 0 → query current break; else move break (page-lazy).
+                    12 => {
+                        if rdi == 0 {
+                            brk_cur
+                        } else {
+                            brk_cur = rdi;
+                            brk_cur
+                        }
+                    }
                     13 => 0,
                     14 => 0,
+                    // Identity syscalls — task runs as root (uid/gid 0).
+                    102 | 104 | 107 | 108 => 0, // getuid / getgid / geteuid / getegid
+                    39 => 1,                     // getpid → 1
+                    110 => 0,                    // getppid → 0
+                    // ioctl(fd, req, argp): report "not a tty" (ENOTTY) for all
+                    // requests. This keeps busybox out of full interactive mode
+                    // (which on this glibc build trips an internal alignment
+                    // assertion), while we still drive an interactive REPL by
+                    // emulating the prompt ourselves in the read(stdin) handler.
+                    16 => (-25i32) as usize,
+                    // job-control stubs: keep the shell out of its tty loop.
+                    121 => 1,                    // getpgid → 1
+                    109 => 0,                    // setpgid → ok
+                    111 => 1,                    // getpgrp → 1
+                    62 => 0,                     // kill → ok (no-op)
+                    // rt_sigaction / rt_sigprocmask / sigaltstack — accept.
+                    131 => 0,
                     60 | 231 => {
                         seL4_DebugPutString("[child] exit(");
                         print_hex(rdi);
@@ -940,16 +1110,76 @@ fn test_busybox(bi_frame_vptr: usize) {
                         already_resumed = true;
                         0
                     }
-                    // arch_prctl: FS_BASE is already programmed by the
-                    // trampoline (wrfsbase). ARCH_GET_FS returns it.
+                    // arch_prctl(code, addr):
+                    //   ARCH_SET_FS (0x1002): glibc points FS_BASE at its own
+                    //     TLS block here. We MUST honor it — the trampoline set
+                    //     a bootstrap FS_BASE, but glibc later allocates the
+                    //     real TLS (locale ptr at +0xa8, stack canary, etc.) and
+                    //     expects FS_BASE to track it. Ignoring this leaves
+                    //     glibc reading TLS slots from the stale bootstrap area,
+                    //     which crashes locale-aware code (e.g. tolower in the
+                    //     interactive prompt) on a NULL locale pointer.
+                    //   ARCH_GET_FS (0x1003): return current FS_BASE.
                     158 => {
-                        if rdi == 0x1003 {
-                            unsafe { core::ptr::write_volatile(rsi as *mut u64, regs[18] as u64); }
+                        match rdi {
+                            0x1002 => {
+                                let e = seL4_TCB_SetTLSBase(busybox_tcb, rsi);
+                                regs[18] = rsi; // keep our shadow copy in sync
+                                if e != 0 {
+                                    seL4_DebugPutString("[child] SetTLSBase err=");
+                                    print_hex(e as usize);
+                                    seL4_DebugPutChar(b'\n');
+                                }
+                                0
+                            }
+                            0x1003 => {
+                                unsafe { core::ptr::write_volatile(rsi as *mut u64, regs[18] as u64); }
+                                0
+                            }
+                            _ => 0,
+                        }
+                    }
+                    // uname(buf): fill a struct utsname (6 × 65-byte fields).
+                    63 => {
+                        let fields: [&[u8]; 6] = [
+                            b"Linux", b"sel4", b"6.0.0-sel4",
+                            b"#1 seL4", b"x86_64", b"(none)",
+                        ];
+                        for (fi, f) in fields.iter().enumerate() {
+                            let base = rdi + fi * 65;
+                            unsafe {
+                                for k in 0..65 {
+                                    let b = if k < f.len() { f[k] } else { 0 };
+                                    core::ptr::write_volatile((base + k) as *mut u8, b);
+                                }
+                            }
                         }
                         0
                     }
+                    // getcwd(buf, size): the raw Linux syscall writes the path
+                    // (NUL-terminated) and returns the LENGTH including the NUL
+                    // (not the buffer pointer — that's the libc wrapper's job).
+                    79 => {
+                        let path = b"/\0";
+                        if rsi >= path.len() {
+                            unsafe {
+                                for (i, &b) in path.iter().enumerate() {
+                                    core::ptr::write_volatile((rdi + i) as *mut u8, b);
+                                }
+                            }
+                            path.len() // 2 (incl. NUL)
+                        } else { (-34i32) as usize } // ERANGE
+                    }
                     218 => 1,
-                    _ => (-38i32) as usize,
+                    other => {
+                        seL4_DebugPutString("[child] UNIMPL syscall ");
+                        print_hex(other);
+                        seL4_DebugPutString(" rdi=0x"); print_hex(rdi);
+                        seL4_DebugPutString(" rsi=0x"); print_hex(rsi);
+                        seL4_DebugPutString(" rdx=0x"); print_hex(rdx);
+                        seL4_DebugPutChar(b'\n');
+                        (-38i32) as usize
+                    }
                 };
 
                 if !child_exited {
@@ -966,22 +1196,29 @@ fn test_busybox(bi_frame_vptr: usize) {
                     already_resumed = true;
                 }
             }
-            // UserException: resume child
+            // UserException: a CPU exception (e.g. #UD invalid opcode, #GP).
+            // Read the exception number from the fault message and report it.
             3 => {
-                let mut regs = [0usize; 20];
-                let _ = seL4_TCB_ReadRegisters(busybox_tcb, false, 0, 20, &mut regs);
-                let info = (0usize << 12) | 3;
-                unsafe {
-                    core::arch::asm!(
-                        "mov r14, rsp", "syscall", "mov rsp, r14",
-                        in("rdx") sel4_sys::SYS_REPLY,
-                        in("rdi") 0usize, in("rsi") info,
-                        in("r10") regs[0], in("r8") regs[1],
-                        in("r9") regs[2], in("r15") 0usize,
-                        lateout("rcx") _, lateout("r11") _, lateout("r14") _,
-                        options(nostack),
-                    );
+                let (ex_ip, ex_num, ex_code) = sel4_sys::with_ipc_buffer(|ib| {
+                    (ib.read_mr(0), ib.read_mr(3), ib.read_mr(4))
+                });
+                seL4_DebugPutString("[busybox] UserException #");
+                print_hex(ex_num);
+                seL4_DebugPutString(" code=0x");
+                print_hex(ex_code);
+                seL4_DebugPutString(" at IP=0x");
+                print_hex(ex_ip);
+                seL4_DebugPutChar(b'\n');
+                // Dump the faulting instruction bytes.
+                seL4_DebugPutString("  insn:");
+                for k in 0..8 {
+                    let b = unsafe { core::ptr::read_volatile((ex_ip + k) as *const u8) };
+                    seL4_DebugPutString(" ");
+                    print_hex(b as usize);
                 }
+                seL4_DebugPutChar(b'\n');
+                let _ = seL4_TCB_Suspend(busybox_tcb);
+                child_exited = true;
                 already_resumed = true;
             }
             _ => {
