@@ -210,9 +210,13 @@ pub fn create_user_task(
     let err = seL4_PageTable_Map(pt_stack_slot, init_slots::VSPACE, 0xF00000, 0);
     if err != 0 { seL4_DebugPutString("[runner] PT stack map failed\n"); return None; }
 
-    // Pre-calculate total ELF frames needed
+    // Pre-calculate total ELF frames needed.
+    // page_info holds (page_vaddr, file_off, copy_off_in_page, copy_len):
+    //   file_off          — byte offset into elf_data to copy from
+    //   copy_off_in_page  — byte offset within the page to copy to
+    //   copy_len          — number of bytes to copy (0 = pure BSS page)
     let mut total_elf_pages: usize = 0;
-    let mut page_info: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new(); // (page_vaddr, data_start, data_end, write_len)
+    let mut page_info: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new();
 
     for i in 0..e_phnum {
         let ph_off = e_phoff + i * e_phentsize;
@@ -227,8 +231,14 @@ pub fn create_user_task(
         if p_type != 1 { continue; }
 
         let relocated_vaddr = p_vaddr.wrapping_add(reloc_offset);
-        let start_page = relocated_vaddr & !(PAGE_SIZE - 1);
-        let end_page = (relocated_vaddr + p_memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // Segments need not be page-aligned (e.g. the RW data segment starts
+        // mid-page). Walk every page the segment touches and copy the slice of
+        // file data that falls inside it at the correct in-page offset.
+        let seg_start = relocated_vaddr;
+        let seg_file_end = relocated_vaddr + p_filesz;   // end of file-backed bytes
+        let seg_mem_end = relocated_vaddr + p_memsz;     // end of mapped region (incl. BSS)
+        let start_page = seg_start & !(PAGE_SIZE - 1);
+        let end_page = (seg_mem_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         seL4_DebugPutString("[runner] PT_LOAD: 0x");
         print_hex(p_vaddr);
@@ -241,17 +251,26 @@ pub fn create_user_task(
         seL4_DebugPutChar(b'\n');
 
         for page_vaddr in (start_page..end_page).step_by(PAGE_SIZE) {
-            let offset_in_segment = page_vaddr - relocated_vaddr;
-            let data_start = if offset_in_segment < p_filesz { p_offset + offset_in_segment } else { 0 };
-            let data_end = if offset_in_segment < p_filesz {
-                (data_start + PAGE_SIZE).min(p_offset + p_filesz)
+            let page_end = page_vaddr + PAGE_SIZE;
+            // Intersect [seg_start, seg_file_end) with [page_vaddr, page_end).
+            let copy_vstart = seg_start.max(page_vaddr);
+            let copy_vend = seg_file_end.min(page_end);
+            let (file_off, copy_off_in_page, copy_len) = if copy_vstart < copy_vend {
+                let file_off = p_offset + (copy_vstart - seg_start);
+                let copy_off_in_page = copy_vstart - page_vaddr;
+                (file_off, copy_off_in_page, copy_vend - copy_vstart)
             } else {
-                0
+                (0, 0, 0) // page is entirely BSS (zero-fill)
             };
-            let write_len = if data_start < data_end { data_end - data_start } else { 0 };
-            page_info.push((page_vaddr, data_start, data_end, write_len));
+            // Skip pages already recorded by an earlier segment (none overlap
+            // for busybox, but guard against double-mapping just in case).
+            if page_info.iter().any(|&(pv, _, _, _)| pv == page_vaddr) {
+                continue;
+            }
+            page_info.push((page_vaddr, file_off, copy_off_in_page, copy_len));
             total_elf_pages += 1;
         }
+        let _ = seg_file_end;
     }
 
     seL4_DebugPutString("[runner] Total ELF pages: ");
@@ -306,7 +325,7 @@ pub fn create_user_task(
 
     // Map and populate each frame
     let mut segments_loaded = 0;
-    for (idx, &(page_vaddr, data_start, data_end, write_len)) in page_info.iter().enumerate() {
+    for (idx, &(page_vaddr, file_off, copy_off_in_page, copy_len)) in page_info.iter().enumerate() {
         let frame_slot = frame_slots[idx];
 
         // Map frame
@@ -323,19 +342,24 @@ pub fn create_user_task(
             return None;
         }
 
-        // Write ELF data to mapped frame
-        if write_len > 0 && data_end <= elf_data.len() {
+        // Zero the whole frame first so BSS and any partial-page gaps are clean.
+        unsafe {
             let dest = page_vaddr as *mut u8;
+            for i in 0..PAGE_SIZE {
+                dest.add(i).write_volatile(0);
+            }
+        }
+
+        // Copy the file-backed slice into the correct in-page offset.
+        if copy_len > 0 && file_off + copy_len <= elf_data.len() {
+            let dest = (page_vaddr + copy_off_in_page) as *mut u8;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    elf_data[data_start..data_end].as_ptr(), dest, write_len,
+                    elf_data[file_off..file_off + copy_len].as_ptr(), dest, copy_len,
                 );
-                // NOTE: Do NOT patch syscall instructions.
-                // Let the child execute syscall directly, which generates
-                // an UnknownSyscall fault (label 2). This is the proper
-                // seL4 mechanism for syscall interception - the kernel
-                // includes ALL registers in the fault message (including RSP),
-                // and the reply mechanism correctly restores them.
+                // NOTE: Do NOT patch syscall instructions. Let the child
+                // execute `syscall` directly, generating an UnknownSyscall
+                // fault (label 2) the root task emulates.
             }
         }
         segments_loaded += 1;
@@ -590,37 +614,42 @@ pub fn create_user_task(
     seL4_DebugPutChar(b'\n');
 
     // Write Linux x86_64 ABI stack frame for the child task.
-    let stack_top = STACK_VADDR + PAGE_SIZE;
+    //
+    // System V x86-64 requires %rsp (pointing at argc) to be 16-byte
+    // aligned at process entry. The data area (strings, AT_RANDOM bytes)
+    // lives at the very top of the stack page and grows down; the argc/
+    // argv/envp/auxv array is then placed below it at a 16-byte aligned
+    // address. CRITICAL: alignment must be applied to the argc address
+    // BEFORE writing the array — never decrement rsp after writing argc.
 
-    // Write "busybox\0" string at offset 256 (past the trampoline and stack frame)
-    let str_addr = STACK_VADDR + 512;
-    let str_data = b"busybox\0";
-    unsafe {
-        let dest = str_addr as *mut u8;
-        for i in 0..str_data.len() {
-            dest.add(i).write_volatile(str_data[i]);
-        }
-    }
+    // --- Data area (top of stack, grows down) ---
+    let mut data = STACK_VADDR + PAGE_SIZE;
 
-    // Write Linux x86_64 ABI stack frame: argc, argv[], NULL, envp[], NULL, auxv[], AT_NULL.
-    // musl needs the auxiliary vector for page size, entry, PHDR, etc.
-    let mut sp = STACK_VADDR + 4096; // start from top of stack page
-
-    // Write 16 "random" bytes for AT_RANDOM at the top of the stack
-    let random_bytes_addr = sp - 16;
+    // 16 random bytes for AT_RANDOM
+    data -= 16;
+    let random_bytes_addr = data;
     unsafe {
         let r = random_bytes_addr as *mut u8;
         for i in 0..16 { r.add(i).write_volatile(i as u8 ^ 0xA5); }
     }
-    sp = random_bytes_addr & !0xF; // 16-byte align
 
-    // Write "busybox\0" string
-    let str_addr = sp - 8;
+    // "x86_64\0" platform string for AT_PLATFORM
+    let platform = b"x86_64\0";
+    data -= platform.len();
+    let platform_addr = data;
+    unsafe {
+        let s = platform_addr as *mut u8;
+        for (i, &b) in platform.iter().enumerate() { s.add(i).write_volatile(b); }
+    }
+
+    // "busybox\0" string for argv[0]
+    let argv0 = b"busybox\0";
+    data -= argv0.len();
+    let str_addr = data;
     unsafe {
         let s = str_addr as *mut u8;
-        for (i, &b) in b"busybox\0".iter().enumerate() { s.add(i).write_volatile(b); }
+        for (i, &b) in argv0.iter().enumerate() { s.add(i).write_volatile(b); }
     }
-    sp = str_addr;
 
     // Compute aux vector values
     let at_entry = relocated_entry;
@@ -629,56 +658,67 @@ pub fn create_user_task(
     let at_phnum = e_phnum;
     let at_pagesz = PAGE_SIZE;
 
-    // Write auxv entries (growing down from sp)
-    let mut write_aux = |a_type: usize, a_val: usize| {
-        sp -= 16;
-        unsafe {
-            let p = sp as *mut usize;
-            p.offset(0).write_volatile(a_type);
-            p.offset(1).write_volatile(a_val);
-        }
+    // auxv pairs (a_type, a_val), AT_NULL terminator added last.
+    let auxv: [(usize, usize); 16] = [
+        (25, random_bytes_addr), // AT_RANDOM
+        (23, 0),                 // AT_SECURE
+        (17, 100),               // AT_CLKTCK
+        (16, 0),                 // AT_HWCAP
+        (15, platform_addr),     // AT_PLATFORM = "x86_64"
+        (14, 0),                 // AT_EGID
+        (13, 0),                 // AT_GID
+        (12, 0),                 // AT_EUID
+        (11, 0),                 // AT_UID
+        (9, at_entry),           // AT_ENTRY
+        (7, 0),                  // AT_BASE (static, not PIE)
+        (6, at_pagesz),          // AT_PAGESZ
+        (5, at_phnum),           // AT_PHNUM
+        (4, at_phent),           // AT_PHENT
+        (3, at_phdr),            // AT_PHDR
+        (0, 0),                  // AT_NULL terminator
+    ];
+
+    // argv[] and envp[] pointers (each NULL-terminated).
+    let argv: [usize; 1] = [str_addr];
+    let envp: [usize; 0] = [];
+
+    // Total array size: argc(8) + argv ptrs + argv NULL + envp ptrs + envp NULL + auxv.
+    let array_words = 1                // argc
+        + argv.len() + 1               // argv[] + NULL
+        + envp.len() + 1               // envp[] + NULL
+        + auxv.len() * 2;              // auxv pairs (AT_NULL already included)
+    let array_bytes = array_words * 8;
+
+    // Place argc at a 16-byte aligned address below the data area. Because the
+    // SysV ABI requires %rsp (== &argc) to be 16-byte aligned at _start entry,
+    // align the BASE — never adjust rsp after writing argc.
+    let mut base = data - array_bytes;
+    base &= !0xF;
+    let rsp = base;
+
+    // Write the array upward from base.
+    let mut p = base;
+    let mut push = |val: usize| {
+        unsafe { (p as *mut usize).write_volatile(val); }
+        p += 8;
     };
+    push(argv.len());                  // argc
+    for &a in &argv { push(a); }       // argv[]
+    push(0);                           // argv NULL
+    for &e in &envp { push(e); }       // envp[]
+    push(0);                           // envp NULL
+    for &(t, v) in &auxv {             // auxv[]
+        push(t);
+        push(v);
+    }
 
-    write_aux(0, 0);                     // AT_NULL (terminator — written first, ends up last)
-    write_aux(25, random_bytes_addr);    // AT_RANDOM
-    write_aux(23, 0);                    // AT_SECURE = 0
-    write_aux(17, 100);                  // AT_CLKTCK = 100
-    write_aux(16, 0);                    // AT_HWCAP = 0
-    write_aux(15, 0);                    // AT_PLATFORM (0 = "x86_64" default)
-    write_aux(14, 0);                    // AT_EGID = 0 (root)
-    write_aux(13, 0);                    // AT_GID = 0
-    write_aux(12, 0);                    // AT_EUID = 0
-    write_aux(11, 0);                    // AT_UID = 0
-    write_aux(9,  at_entry);            // AT_ENTRY
-    write_aux(7,  0);                   // AT_BASE = 0 (static, not PIE)
-    write_aux(6,  at_pagesz);           // AT_PAGESZ = 4096
-    write_aux(5,  at_phnum);            // AT_PHNUM
-    write_aux(4,  at_phent);            // AT_PHENT
-    write_aux(3,  at_phdr);             // AT_PHDR
-
-    // envp[] — empty
-    sp -= 8;
-    unsafe { (sp as *mut usize).write_volatile(0); }  // envp[0] = NULL
-
-    // argv[]
-    sp -= 8;
-    unsafe { (sp as *mut usize).write_volatile(0); }  // argv[1] = NULL
-    sp -= 8;
-    unsafe { (sp as *mut usize).write_volatile(str_addr); }  // argv[0] = "busybox"
-
-    // argc
-    sp -= 8;
-    unsafe { (sp as *mut usize).write_volatile(1); }  // argc = 1
-
-    // x86_64 ABI requires 16-byte stack alignment at function entry.
-    // The stack should be 16-byte aligned BEFORE the call instruction
-    // (which pushes 8-byte return address), so it's 8-byte aligned at
-    // _start entry. But for ET_EXEC, _start doesn't have a return address
-    // pushed, so sp & 0xF should be 0 (or 8 depending on ABI interpretation).
-    // Just force 16-byte alignment:
-    sp &= !0xF;
-
-    let rsp = sp; // final stack pointer
+    seL4_DebugPutString("[runner] rsp=0x");
+    print_hex(rsp);
+    seL4_DebugPutString(" argc@0x");
+    print_hex(base);
+    seL4_DebugPutString(" argv0=0x");
+    print_hex(str_addr);
+    seL4_DebugPutChar(b'\n');
 
     // Write initial registers (seL4 x86_64 UserContext layout)
     // Index 0=RIP, 1=RSP, 2=RFLAGS, 3=RAX, 4=RBX, 5=RCX, 6=RDX,

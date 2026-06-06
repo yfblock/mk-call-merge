@@ -835,6 +835,8 @@ fn test_busybox(bi_frame_vptr: usize) {
                         print_hex(regs[0]);
                         seL4_DebugPutString(" RSP=0x");
                         print_hex(regs[1]);
+                        seL4_DebugPutString(" faddr=0x");
+                        print_hex(fault_addr);
                         seL4_DebugPutString(" - killing\n");
                         kill_child = true;
                         return;
@@ -890,27 +892,22 @@ fn test_busybox(bi_frame_vptr: usize) {
                     }
                 });
             }
-            // UnknownSyscall: handle syscall
+            // UnknownSyscall: emulate the syscall by rewriting the child's
+            // register file (RAX = return value, RIP past the `syscall`
+            // instruction) and then sending an empty fault reply to restart
+            // it. This avoids the fragile hand-rolled MR layout — the kernel's
+            // copyMRsFaultReply with length 0 leaves our WriteRegisters values
+            // intact instead of clobbering SP/RIP from message registers.
             2 => {
                 let mut regs = [0usize; 20];
                 let err = seL4_TCB_ReadRegisters(busybox_tcb, false, 0, 20, &mut regs);
                 if err != 0 { continue; }
 
                 let rip = regs[0];
-                let rflags = regs[2];
                 let rax = regs[3];
                 let rdi = regs[8];
                 let rsi = regs[7];
                 let rdx = regs[6];
-                let rsp = regs[1];  // RSP = frameRegisters[1]
-
-                if fault_count <= 5 {
-                    seL4_DebugPutString("[child] rsp=0x");
-                    print_hex(rsp);
-                    seL4_DebugPutString(" rip=0x");
-                    print_hex(rip);
-                    seL4_DebugPutChar(b'\n');
-                }
 
                 let ret_val: usize = match rax {
                     0 => 0,
@@ -918,7 +915,6 @@ fn test_busybox(bi_frame_vptr: usize) {
                         if rdi <= 2 {
                             for j in 0..rdx.min(4096) {
                                 let byte = unsafe { *((rsi + j) as *const u8) };
-                                if byte == 0 { break; }
                                 seL4_DebugPutChar(byte);
                             }
                             rdx
@@ -940,43 +936,29 @@ fn test_busybox(bi_frame_vptr: usize) {
                         already_resumed = true;
                         0
                     }
+                    // arch_prctl: FS_BASE is already programmed by the
+                    // trampoline (wrfsbase). ARCH_GET_FS returns it.
                     158 => {
-                        if rdi == 0x1001 { 0 }
-                        else if rdi == 0x1002 {
-                            unsafe { core::ptr::write_volatile(rsi as *mut u64, 0x720000u64); }
-                            0
-                        } else if rdi == 0x1003 {
-                            unsafe { core::ptr::write_volatile(rsi as *mut u64, 0u64); }
-                            0
-                        } else { 0 }
+                        if rdi == 0x1003 {
+                            unsafe { core::ptr::write_volatile(rsi as *mut u64, regs[18] as u64); }
+                        }
+                        0
                     }
                     218 => 1,
                     _ => (-38i32) as usize,
                 };
 
                 if !child_exited {
-                    let new_rip = rip.wrapping_add(2);
-                    let reply_mrs: [usize; 19] = [
-                        ret_val, regs[4], regs[5], rdx, rsi, rdi,
-                        regs[9], regs[10], regs[11], regs[12],
-                        regs[13], regs[14], regs[15], regs[16], regs[17],
-                        new_rip, rsp, rflags, rax,
-                    ];
-                    sel4_sys::with_ipc_buffer(|ib| {
-                        for i in 4..19 { ib.write_mr(i, reply_mrs[i]); }
-                    });
-                    let info = (0usize << 12) | 19;
-                    unsafe {
-                        core::arch::asm!(
-                            "mov r14, rsp", "syscall", "mov rsp, r14",
-                            in("rdx") sel4_sys::SYS_REPLY,
-                            in("rdi") 0usize, in("rsi") info,
-                            in("r10") reply_mrs[0], in("r8") reply_mrs[1],
-                            in("r9") reply_mrs[2], in("r15") reply_mrs[3],
-                            lateout("rcx") _, lateout("r11") _, lateout("r14") _,
-                            options(nostack),
-                        );
+                    regs[3] = ret_val;              // RAX = syscall return value
+                    regs[0] = rip.wrapping_add(2);  // RIP past the 2-byte syscall
+                    let werr = seL4_TCB_WriteRegisters(busybox_tcb, false, 0, 18, &regs);
+                    if werr != 0 {
+                        seL4_DebugPutString("[child] WriteRegs fail err=");
+                        print_hex(werr as usize);
+                        seL4_DebugPutChar(b'\n');
                     }
+                    let reply = sel4_sys::MessageInfo::new(0, 0, 0);
+                    seL4_Reply(reply.word());
                     already_resumed = true;
                 }
             }
